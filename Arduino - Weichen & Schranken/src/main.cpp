@@ -9,11 +9,12 @@ unsigned long lastStepMs = 0;
 const unsigned long stepIntervalMs = 15; // ms between steps
 const int stepSize = 2;                  // degrees per step
 
-// LED blink (pin 6) while motors are moving
-const int ledPin = 6;
-bool ledState = false;
-unsigned long lastLedToggleMs = 0;
-const unsigned long ledBlinkIntervalMs = 150;
+// Level crossing lamps: alternate two lamps
+const int lamp1Pin = 6;
+const int lamp2Pin = 7;
+bool lampPhase = false; // false: lamp1 on, true: lamp2 on
+unsigned long lastLampToggleMs = 0;
+const unsigned long lampBlinkIntervalMs = 400; // ms between toggles
 
 // Timed move state (fixed-duration interpolation on Arduino)
 bool moveActive = false;
@@ -31,6 +32,19 @@ int move2EndAngle = 90;
 unsigned long move2StartMs = 0;
 unsigned long move2DurationMs = 0;
 
+// BÜ state machine
+bool crossingBlinkActive = false;        // overall blinking active
+bool crossingCloseCommanded = false;     // barrier close has been started
+bool crossingOpeningDelayActive = false; // lamp delay when opening
+unsigned long crossingBlinkStartMs = 0;  // when blinking started
+unsigned long crossingOpeningStartMs = 0; // when opening started (for lamp delay)
+const unsigned long preBlinkDelayMs = 6000; // 6 seconds delay before closing
+const unsigned long lampStopDelayMs = 500; // 500ms delay before stopping lamps when opening
+const int barrierClosedAngle = 90;       // closed position (was swapped)
+const int barrierOpenAngle = 0;          // open position (was swapped)
+const unsigned long barrierCloseDurationMs = 2000; // ms for closing
+const unsigned long barrierOpenDurationMs = 3000;  // ms for opening (slower)
+
 void setup() {
   myServo.attach(9);
   myServo2.attach(8);
@@ -38,8 +52,10 @@ void setup() {
   myServo2.write(currentAngle2);
   Serial.begin(9600);
   Serial.setTimeout(20); // allow full line to arrive for readStringUntil
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LOW);
+  pinMode(lamp1Pin, OUTPUT);
+  pinMode(lamp2Pin, OUTPUT);
+  digitalWrite(lamp1Pin, LOW);
+  digitalWrite(lamp2Pin, LOW);
 }
 
 void loop() {
@@ -47,6 +63,36 @@ void loop() {
     String line = Serial.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) {
+      // BÜ Zu command - start indefinite blinking, wait 6s, then close gates
+      if (line.equalsIgnoreCase("BZU")) {
+        // Start alternating lamps immediately
+        crossingBlinkActive = true;
+        crossingCloseCommanded = false; // reset to allow delayed closing
+        crossingOpeningDelayActive = false; // cancel any opening delay
+        crossingBlinkStartMs = millis(); // record start time for delay
+        lampPhase = false; // start with lamp1 on
+        digitalWrite(lamp1Pin, HIGH);
+        digitalWrite(lamp2Pin, LOW);
+        lastLampToggleMs = millis();
+        // Gate closing will start after preBlinkDelayMs in the main loop
+      }
+      // BÜ Auf command - open gates immediately, stop lamps after 500ms delay
+      else if (line.equalsIgnoreCase("BAUF")) {
+        // Mark for delayed lamp stop (if lamps are blinking)
+        if (crossingBlinkActive) {
+          crossingOpeningDelayActive = true;
+          crossingOpeningStartMs = millis();
+        }
+        crossingCloseCommanded = false; // prevent any closing action
+        
+        // Start opening barrier immediately (force new movement)
+        move2StartAngle = currentAngle2;
+        move2EndAngle = barrierOpenAngle;
+        move2StartMs = millis();
+        move2DurationMs = barrierOpenDurationMs;
+        move2Active = true; // force start even if already moving
+      }
+      else
       // Check for second motor command: "M2 <angle>"
       if (line.startsWith("M2")) {
         // Accept either: "M2 <angle>" or "M2 <angle> <durationMs>"
@@ -154,20 +200,33 @@ void loop() {
     }
   }
 
-  // LED blinking logic: blink while any motor is moving
-  // Consider movement if: servo1 timed move active, servo2 timed move active,
-  // or servo1 in step mode has not yet reached targetAngle
-  bool movingNow = moveActive || move2Active || (currentAngle != targetAngle);
-  if (movingNow) {
-    if (now - lastLedToggleMs >= ledBlinkIntervalMs) {
-      ledState = !ledState;
-      digitalWrite(ledPin, ledState ? HIGH : LOW);
-      lastLedToggleMs = now;
+  // BÜ alternating lamp logic - continues indefinitely until BAUF command
+  if (crossingBlinkActive) {
+    // toggle lamps periodically
+    if (now - lastLampToggleMs >= lampBlinkIntervalMs) {
+      lampPhase = !lampPhase;
+      digitalWrite(lamp1Pin, lampPhase ? LOW : HIGH);
+      digitalWrite(lamp2Pin, lampPhase ? HIGH : LOW);
+      lastLampToggleMs = now;
     }
-  } else {
-    if (ledState) {
-      ledState = false;
-      digitalWrite(ledPin, LOW);
+    
+    // After 6 seconds of blinking, start closing the barrier (only if not opening)
+    if (!crossingCloseCommanded && !crossingOpeningDelayActive && (now - crossingBlinkStartMs >= preBlinkDelayMs)) {
+      move2StartAngle = currentAngle2;
+      move2EndAngle = barrierClosedAngle;
+      move2StartMs = now;
+      move2DurationMs = barrierCloseDurationMs;
+      move2Active = true;
+      crossingCloseCommanded = true;
     }
   }
+  
+  // Handle delayed lamp stop when opening
+  if (crossingOpeningDelayActive && (now - crossingOpeningStartMs >= lampStopDelayMs)) {
+    crossingBlinkActive = false;
+    crossingOpeningDelayActive = false;
+    digitalWrite(lamp1Pin, LOW);
+    digitalWrite(lamp2Pin, LOW);
+  }
 }
+

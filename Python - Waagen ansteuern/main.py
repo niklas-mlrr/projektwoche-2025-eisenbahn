@@ -123,10 +123,10 @@ async def main():
         try:
             print(f"Trying port 0x{port:02X} with WriteDirectModeData speed 50...")
             # Mode 0x00 is commonly the speed mode for simple motors
-            await conn.write(make_write_direct_mode_data(port_id=port, mode=0x00, *[(50 + 256) % 256]))
+            await conn.write(make_write_direct_mode_data(port, 0x00, (50 + 256) % 256))
             await asyncio.sleep(2.0)
             # Stop
-            await conn.write(make_write_direct_mode_data(port_id=port, mode=0x00, *[0]))
+            await conn.write(make_write_direct_mode_data(port, 0x00, 0))
 
             print("Trying StartSpeed 50 then stop...")
             await conn.write(make_start_speed(port_id=port, speed=50, max_power=100, use_profile=0))
