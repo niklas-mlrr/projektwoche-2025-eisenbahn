@@ -65,37 +65,7 @@ def make_start_speed_for_degrees(port_id: int, degrees: int, speed: int,
     ])
     return bytes([len(payload) + 1]) + payload
 
-def make_start_power(port_id: int, power: int) -> bytes:
-    """StartPower command - unregulated power [0x01]"""
-    if power < -100 or power > 100:
-        raise ValueError("power must be in [-100..100]")
-    payload = bytes([
-        0x00, 0x81, port_id & 0xFF, 0x11, 0x01,
-        (power + 256) % 256,
-    ])
-    return bytes([len(payload) + 1]) + payload
 
-def make_set_acc_time(port_id: int, time_ms: int, profile_no: int = 0) -> bytes:
-    """SetAccTime command [0x05]"""
-    time_l = time_ms & 0xFF
-    time_h = (time_ms >> 8) & 0xFF
-    payload = bytes([
-        0x00, 0x81, port_id & 0xFF, 0x11, 0x05,
-        time_l, time_h,
-        profile_no & 0xFF,
-    ])
-    return bytes([len(payload) + 1]) + payload
-
-def make_set_dec_time(port_id: int, time_ms: int, profile_no: int = 0) -> bytes:
-    """SetDecTime command [0x06]"""
-    time_l = time_ms & 0xFF
-    time_h = (time_ms >> 8) & 0xFF
-    payload = bytes([
-        0x00, 0x81, port_id & 0xFF, 0x11, 0x06,
-        time_l, time_h,
-        profile_no & 0xFF,
-    ])
-    return bytes([len(payload) + 1]) + payload
 
 def make_write_direct_mode_data(port_id: int, mode: int, *data: int) -> bytes:
     """WriteDirectModeData command [0x51]"""
@@ -106,9 +76,12 @@ def make_write_direct_mode_data(port_id: int, mode: int, *data: int) -> bytes:
     return bytes([len(payload) + 1]) + payload
 
 def make_hub_led_color(color: int) -> bytes:
-    """Set Hub LED color (port 50 is the hub LED)"""
+    """Set Hub LED color using WriteDirectModeData to port 50 (hub LED)"""
+    # Port 50 (0x32) is the hub LED port
+    # Mode 0 is the color mode
     payload = bytes([
-        0x00, 0x81, 0x32, 0x11, 0x51, 0x00, color & 0xFF
+        0x00, 0x81, 0x32, 0x11, 0x51,
+        0x00, color & 0xFF
     ])
     return bytes([len(payload) + 1]) + payload
 
@@ -147,23 +120,25 @@ class TrainHubGUI:
         self.async_thread = None
         
         # Control variables
-        self.port_var = tk.IntVar(value=0)
         self.speed_var = tk.IntVar(value=0)
-        self.power_var = tk.IntVar(value=0)
-        self.max_power_var = tk.IntVar(value=100)
         self.time_var = tk.IntVar(value=2000)
         self.degrees_var = tk.IntVar(value=360)
-        self.acc_time_var = tk.IntVar(value=1000)
-        self.dec_time_var = tk.IntVar(value=1000)
-        self.use_profile_var = tk.BooleanVar(value=False)
         self.end_state_var = tk.StringVar(value="Brake")
         self.led_color_var = tk.IntVar(value=0)
+        self.use_direct_mode = tk.BooleanVar(value=True)  # Use WriteDirectModeData by default
+        
+        # Color sensor variables
+        self.color_sensor_port = tk.IntVar(value=1)  # Default to port 1 for color sensor
+        self.current_color = tk.StringVar(value="Unknown")
+        self.current_color_value = tk.IntVar(value=-1)
+        self.color_sensor_enabled = False
         
         # Debug variables
         self.debug_enabled = tk.BooleanVar(value=True)
         self.log_rx = tk.BooleanVar(value=True)
         self.log_tx = tk.BooleanVar(value=True)
         self.received_messages = []
+        self.working_ports = set()  # Track which ports have working motors
         
         self.create_widgets()
         
@@ -211,40 +186,55 @@ class TrainHubGUI:
         notebook.add(tab1, text="Basic Motor Control")
         self.create_basic_motor_tab(tab1)
         
-        # Tab 2: Advanced Motor Control
+        # Tab 2: Hub Control
         tab2 = tk.Frame(notebook, bg='#2b2b2b')
-        notebook.add(tab2, text="Advanced Motor Control")
-        self.create_advanced_motor_tab(tab2)
+        notebook.add(tab2, text="Hub Control")
+        self.create_hub_control_tab(tab2)
         
-        # Tab 3: Hub Control
+        # Tab 3: Color Sensor
         tab3 = tk.Frame(notebook, bg='#2b2b2b')
-        notebook.add(tab3, text="Hub Control")
-        self.create_hub_control_tab(tab3)
+        notebook.add(tab3, text="Color Sensor")
+        self.create_color_sensor_tab(tab3)
         
-        # Tab 4: Profiles & Settings
+        # Tab 4: Debug & Diagnostics
         tab4 = tk.Frame(notebook, bg='#2b2b2b')
-        notebook.add(tab4, text="Profiles & Settings")
-        self.create_profiles_tab(tab4)
-        
-        # Tab 5: Debug & Diagnostics
-        tab5 = tk.Frame(notebook, bg='#2b2b2b')
-        notebook.add(tab5, text="Debug & Diagnostics")
-        self.create_debug_tab(tab5)
+        notebook.add(tab4, text="Debug & Diagnostics")
+        self.create_debug_tab(tab4)
         
     def create_basic_motor_tab(self, parent):
-        # Port Selection
-        port_frame = tk.LabelFrame(parent, text="Port Selection", bg='#2b2b2b', fg='#ffffff',
-                                   font=('Arial', 10, 'bold'), pady=10)
-        port_frame.pack(fill=tk.X, padx=10, pady=5)
+        # Info label
+        info_frame = tk.Frame(parent, bg='#2b2b2b', pady=5)
+        info_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(info_frame, text="Controlling Port 0 (Motor)", 
+                bg='#2b2b2b', fg='#4CAF50', font=('Arial', 10, 'bold')).pack()
         
-        for i, port_name in enumerate(["Port 0 (Motor A)", "Port 1 (Motor B)", "Port 2 (Motor C)"]):
-            tk.Radiobutton(port_frame, text=port_name, variable=self.port_var, value=i,
-                          bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
-                          font=('Arial', 9), activebackground='#2b2b2b',
-                          activeforeground='#ffffff').pack(side=tk.LEFT, padx=20)
+        # Instant Speed Control
+        instant_frame = tk.LabelFrame(parent, text="Instant Speed Control", bg='#2b2b2b', 
+                                     fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
+        instant_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        # Speed Control
-        speed_frame = tk.LabelFrame(parent, text="Speed Control (Regulated)", bg='#2b2b2b', 
+        tk.Label(instant_frame, text="Speed: -100 to 100 (changes instantly, skips -30 to +30)", bg='#2b2b2b', fg='#ffffff',
+                font=('Arial', 9)).pack()
+        
+        # Create instant speed variable
+        self.instant_speed_var = tk.IntVar(value=0)
+        
+        instant_slider = tk.Scale(instant_frame, from_=-100, to=100, orient=tk.HORIZONTAL,
+                                 variable=self.instant_speed_var, bg='#3c3c3c', fg='#ffffff',
+                                 highlightthickness=0, length=400, troughcolor='#1e88e5',
+                                 command=self.on_instant_speed_change, resolution=1)
+        instant_slider.pack(pady=5)
+        
+        instant_value_label = tk.Label(instant_frame, textvariable=self.instant_speed_var, 
+                                       bg='#2b2b2b', fg='#4CAF50', font=('Arial', 14, 'bold'))
+        instant_value_label.pack()
+        
+        # Stop button
+        tk.Button(instant_frame, text="Stop", command=self.stop_instant_speed,
+                 bg='#f44336', fg='white', font=('Arial', 10, 'bold'), padx=30, pady=5).pack(pady=5)
+        
+        # Speed Control with Button
+        speed_frame = tk.LabelFrame(parent, text="Speed Control (with Button)", bg='#2b2b2b', 
                                    fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
         speed_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -268,98 +258,6 @@ class TrainHubGUI:
         tk.Button(btn_frame, text="Stop Motor", command=self.stop_motor,
                  bg='#f44336', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).pack(side=tk.LEFT, padx=5)
         
-        # Quick Speed Buttons
-        quick_frame = tk.Frame(speed_frame, bg='#2b2b2b')
-        quick_frame.pack(pady=5)
-        
-        for speed in [-100, -50, 0, 50, 100]:
-            tk.Button(quick_frame, text=f"{speed:+d}", 
-                     command=lambda s=speed: self.set_quick_speed(s),
-                     bg='#607D8B', fg='white', font=('Arial', 9), padx=10, pady=3).pack(side=tk.LEFT, padx=3)
-        
-        # Power Control (Unregulated)
-        power_frame = tk.LabelFrame(parent, text="Power Control (Unregulated)", bg='#2b2b2b',
-                                   fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
-        power_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(power_frame, text="Power: -100 to 100", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).pack()
-        
-        power_slider = tk.Scale(power_frame, from_=-100, to=100, orient=tk.HORIZONTAL,
-                               variable=self.power_var, bg='#3c3c3c', fg='#ffffff',
-                               highlightthickness=0, length=400, troughcolor='#ff9800')
-        power_slider.pack(pady=5)
-        
-        tk.Button(power_frame, text="Apply Power", command=self.start_power,
-                 bg='#ff9800', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).pack(pady=5)
-        
-    def create_advanced_motor_tab(self, parent):
-        # Timed Movement
-        timed_frame = tk.LabelFrame(parent, text="Timed Movement", bg='#2b2b2b', fg='#ffffff',
-                                   font=('Arial', 10, 'bold'), pady=10)
-        timed_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(timed_frame, text="Duration (ms):", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=0, column=0, padx=10, pady=5, sticky='w')
-        tk.Scale(timed_frame, from_=100, to=10000, orient=tk.HORIZONTAL,
-                variable=self.time_var, bg='#3c3c3c', fg='#ffffff',
-                highlightthickness=0, length=300).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(timed_frame, textvariable=self.time_var, bg='#2b2b2b', fg='#4CAF50',
-                font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=10, pady=5)
-        
-        tk.Label(timed_frame, text="Speed:", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=1, column=0, padx=10, pady=5, sticky='w')
-        tk.Label(timed_frame, textvariable=self.speed_var, bg='#2b2b2b', fg='#4CAF50',
-                font=('Arial', 10, 'bold')).grid(row=1, column=1, padx=10, pady=5, sticky='w')
-        
-        tk.Button(timed_frame, text="Run for Time", command=self.start_speed_for_time,
-                 bg='#2196F3', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).grid(row=2, column=1, pady=10)
-        
-        # Degree-based Movement
-        degree_frame = tk.LabelFrame(parent, text="Degree-based Movement", bg='#2b2b2b', fg='#ffffff',
-                                    font=('Arial', 10, 'bold'), pady=10)
-        degree_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(degree_frame, text="Degrees:", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=0, column=0, padx=10, pady=5, sticky='w')
-        tk.Scale(degree_frame, from_=0, to=3600, orient=tk.HORIZONTAL,
-                variable=self.degrees_var, bg='#3c3c3c', fg='#ffffff',
-                highlightthickness=0, length=300).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(degree_frame, textvariable=self.degrees_var, bg='#2b2b2b', fg='#4CAF50',
-                font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=10, pady=5)
-        
-        tk.Label(degree_frame, text="Speed:", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=1, column=0, padx=10, pady=5, sticky='w')
-        tk.Label(degree_frame, textvariable=self.speed_var, bg='#2b2b2b', fg='#4CAF50',
-                font=('Arial', 10, 'bold')).grid(row=1, column=1, padx=10, pady=5, sticky='w')
-        
-        tk.Button(degree_frame, text="Run for Degrees", command=self.start_speed_for_degrees,
-                 bg='#9C27B0', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).grid(row=2, column=1, pady=10)
-        
-        # Max Power & End State
-        settings_frame = tk.LabelFrame(parent, text="Movement Settings", bg='#2b2b2b', fg='#ffffff',
-                                      font=('Arial', 10, 'bold'), pady=10)
-        settings_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(settings_frame, text="Max Power (%):", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=0, column=0, padx=10, pady=5, sticky='w')
-        tk.Scale(settings_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-                variable=self.max_power_var, bg='#3c3c3c', fg='#ffffff',
-                highlightthickness=0, length=300).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(settings_frame, textvariable=self.max_power_var, bg='#2b2b2b', fg='#4CAF50',
-                font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=10, pady=5)
-        
-        tk.Label(settings_frame, text="End State:", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=1, column=0, padx=10, pady=5, sticky='w')
-        
-        end_state_frame = tk.Frame(settings_frame, bg='#2b2b2b')
-        end_state_frame.grid(row=1, column=1, padx=10, pady=5, sticky='w')
-        
-        for state in ["Float", "Hold", "Brake"]:
-            tk.Radiobutton(end_state_frame, text=state, variable=self.end_state_var, value=state,
-                          bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
-                          font=('Arial', 9), activebackground='#2b2b2b',
-                          activeforeground='#ffffff').pack(side=tk.LEFT, padx=10)
         
     def create_hub_control_tab(self, parent):
         # Hub LED Control
@@ -407,52 +305,6 @@ class TrainHubGUI:
         tk.Button(emergency_frame, text="🛑 EMERGENCY STOP ALL", command=self.emergency_stop,
                  bg='#d32f2f', fg='white', font=('Arial', 14, 'bold'), padx=30, pady=15).pack(pady=10)
         
-    def create_profiles_tab(self, parent):
-        # Acceleration Profile
-        acc_frame = tk.LabelFrame(parent, text="Acceleration Profile", bg='#2b2b2b', fg='#ffffff',
-                                 font=('Arial', 10, 'bold'), pady=10)
-        acc_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(acc_frame, text="Acceleration Time (ms):", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=0, column=0, padx=10, pady=5, sticky='w')
-        tk.Scale(acc_frame, from_=0, to=10000, orient=tk.HORIZONTAL,
-                variable=self.acc_time_var, bg='#3c3c3c', fg='#ffffff',
-                highlightthickness=0, length=300).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(acc_frame, textvariable=self.acc_time_var, bg='#2b2b2b', fg='#4CAF50',
-                font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=10, pady=5)
-        
-        tk.Button(acc_frame, text="Set Acceleration Profile", command=self.set_acc_profile,
-                 bg='#4CAF50', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).grid(row=1, column=1, pady=10)
-        
-        # Deceleration Profile
-        dec_frame = tk.LabelFrame(parent, text="Deceleration Profile", bg='#2b2b2b', fg='#ffffff',
-                                 font=('Arial', 10, 'bold'), pady=10)
-        dec_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(dec_frame, text="Deceleration Time (ms):", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 9)).grid(row=0, column=0, padx=10, pady=5, sticky='w')
-        tk.Scale(dec_frame, from_=0, to=10000, orient=tk.HORIZONTAL,
-                variable=self.dec_time_var, bg='#3c3c3c', fg='#ffffff',
-                highlightthickness=0, length=300).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(dec_frame, textvariable=self.dec_time_var, bg='#2b2b2b', fg='#4CAF50',
-                font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=10, pady=5)
-        
-        tk.Button(dec_frame, text="Set Deceleration Profile", command=self.set_dec_profile,
-                 bg='#ff9800', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).grid(row=1, column=1, pady=10)
-        
-        # Use Profile Toggle
-        profile_frame = tk.LabelFrame(parent, text="Profile Usage", bg='#2b2b2b', fg='#ffffff',
-                                     font=('Arial', 10, 'bold'), pady=10)
-        profile_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Checkbutton(profile_frame, text="Use Acceleration/Deceleration Profiles",
-                      variable=self.use_profile_var, bg='#2b2b2b', fg='#ffffff',
-                      selectcolor='#1e88e5', font=('Arial', 10),
-                      activebackground='#2b2b2b', activeforeground='#ffffff').pack(pady=10)
-        
-        tk.Label(profile_frame, text="When enabled, motor commands will use the configured profiles\nfor smooth acceleration and deceleration.",
-                bg='#2b2b2b', fg='#9e9e9e', font=('Arial', 9, 'italic')).pack(pady=5)
-    
     def create_debug_tab(self, parent):
         # Debug Console
         console_frame = tk.LabelFrame(parent, text="Debug Console", bg='#2b2b2b', fg='#ffffff',
@@ -511,6 +363,9 @@ class TrainHubGUI:
         tk.Button(test_frame, text="Test All Ports", command=self.test_all_ports,
                  bg='#4CAF50', fg='white', font=('Arial', 9), padx=10, pady=3).pack(side=tk.LEFT, padx=5)
         
+        tk.Button(test_frame, text="Check RX Handler", command=self.check_rx_handler,
+                 bg='#f44336', fg='white', font=('Arial', 9), padx=10, pady=3).pack(side=tk.LEFT, padx=5)
+        
         # Raw command sender
         raw_frame = tk.LabelFrame(parent, text="Raw Command Sender", bg='#2b2b2b', fg='#ffffff',
                                  font=('Arial', 10, 'bold'), pady=10)
@@ -539,6 +394,96 @@ class TrainHubGUI:
         self.info_text.config(state=tk.DISABLED)
         
         self.log_debug("Debug console initialized")
+    
+    def create_color_sensor_tab(self, parent):
+        # Info label
+        info_frame = tk.Frame(parent, bg='#2b2b2b', pady=10)
+        info_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(info_frame, text="🎨 Color Sensor Reader", 
+                bg='#2b2b2b', fg='#4CAF50', font=('Arial', 14, 'bold')).pack()
+        tk.Label(info_frame, text="Read color values from the Train Hub color sensor", 
+                bg='#2b2b2b', fg='#ffffff', font=('Arial', 9)).pack()
+        
+        # Port selection
+        port_frame = tk.LabelFrame(parent, text="Sensor Configuration", bg='#2b2b2b', 
+                                   fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
+        port_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Label(port_frame, text="Color Sensor Port:", bg='#2b2b2b', fg='#ffffff',
+                font=('Arial', 10)).pack(side=tk.LEFT, padx=10)
+        
+        for port in [0, 1, 2, 3]:
+            tk.Radiobutton(port_frame, text=f"Port {port}", variable=self.color_sensor_port,
+                          value=port, bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
+                          font=('Arial', 9), activebackground='#2b2b2b',
+                          activeforeground='#ffffff').pack(side=tk.LEFT, padx=5)
+        
+        # Control buttons
+        btn_frame = tk.Frame(port_frame, bg='#2b2b2b')
+        btn_frame.pack(pady=10)
+        
+        self.enable_color_btn = tk.Button(btn_frame, text="Enable Color Sensor", 
+                                         command=self.enable_color_sensor,
+                                         bg='#4CAF50', fg='white', font=('Arial', 10, 'bold'),
+                                         padx=20, pady=5)
+        self.enable_color_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.disable_color_btn = tk.Button(btn_frame, text="Disable Color Sensor", 
+                                          command=self.disable_color_sensor,
+                                          bg='#f44336', fg='white', font=('Arial', 10, 'bold'),
+                                          padx=20, pady=5, state=tk.DISABLED)
+        self.disable_color_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Color display
+        display_frame = tk.LabelFrame(parent, text="Current Color Reading", bg='#2b2b2b',
+                                     fg='#ffffff', font=('Arial', 10, 'bold'), pady=20)
+        display_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Large color display box
+        self.color_display = tk.Frame(display_frame, bg='#1e1e1e', width=300, height=200,
+                                     relief=tk.RAISED, borderwidth=3)
+        self.color_display.pack(pady=20)
+        self.color_display.pack_propagate(False)
+        
+        self.color_name_label = tk.Label(self.color_display, textvariable=self.current_color,
+                                        bg='#1e1e1e', fg='#ffffff', font=('Arial', 24, 'bold'))
+        self.color_name_label.pack(expand=True)
+        
+        # Color value display
+        value_frame = tk.Frame(display_frame, bg='#2b2b2b')
+        value_frame.pack(pady=10)
+        
+        tk.Label(value_frame, text="Raw Value:", bg='#2b2b2b', fg='#ffffff',
+                font=('Arial', 10)).pack(side=tk.LEFT, padx=5)
+        tk.Label(value_frame, textvariable=self.current_color_value, bg='#2b2b2b',
+                fg='#4CAF50', font=('Arial', 14, 'bold')).pack(side=tk.LEFT, padx=5)
+        
+        # Color legend
+        legend_frame = tk.LabelFrame(parent, text="Color Values Reference", bg='#2b2b2b',
+                                    fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
+        legend_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        colors_info = [
+            ("0: Black", "#000000"), ("1: Pink", "#FF69B4"), ("2: Purple", "#800080"),
+            ("3: Blue", "#0000FF"), ("4: Light Blue", "#87CEEB"), ("5: Cyan", "#00FFFF"),
+            ("6: Green", "#00FF00"), ("7: Yellow", "#FFFF00"), ("8: Orange", "#FFA500"),
+            ("9: Red", "#FF0000"), ("10: White", "#FFFFFF")
+        ]
+        
+        legend_grid = tk.Frame(legend_frame, bg='#2b2b2b')
+        legend_grid.pack(pady=5)
+        
+        for idx, (text, color) in enumerate(colors_info):
+            row = idx // 4
+            col = idx % 4
+            frame = tk.Frame(legend_grid, bg='#2b2b2b')
+            frame.grid(row=row, column=col, padx=5, pady=3)
+            
+            color_box = tk.Label(frame, bg=color, width=2, height=1, relief=tk.RAISED)
+            color_box.pack(side=tk.LEFT, padx=2)
+            
+            tk.Label(frame, text=text, bg='#2b2b2b', fg='#ffffff',
+                    font=('Arial', 8)).pack(side=tk.LEFT, padx=2)
         
     # Connection Methods
     def connect_hub(self):
@@ -550,50 +495,80 @@ class TrainHubGUI:
         self.async_thread.start()
         
     def async_connect_worker(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
         try:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+            # First connect
             self.loop.run_until_complete(self.async_connect())
-            # Keep loop running for commands
+            # Then keep loop running for commands
             self.loop.run_until_complete(self.command_processor())
-        except Exception as e:
-            self.root.after(0, lambda: self.connection_failed(str(e)))
+        except asyncio.CancelledError:
+            # Normal cancellation during shutdown
+            pass
+        except Exception as ex:
+            error_msg = str(ex)
+            self.root.after(0, lambda msg=error_msg: self.connection_failed(msg))
         finally:
-            if self.loop:
-                self.loop.close()
+            # Clean up
+            try:
+                if self.loop and not self.loop.is_closed():
+                    # Cancel all pending tasks
+                    pending = asyncio.all_tasks(self.loop)
+                    for task in pending:
+                        task.cancel()
+                    # Give tasks a chance to finish
+                    if pending:
+                        self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    self.loop.close()
+            except:
+                pass
     
     async def async_connect(self):
         try:
+            self.log_debug("Starting connection process...")
+            
             # Scan for device
             device = None
             for attempt in range(3):
                 try:
+                    self.log_debug(f"Scan attempt {attempt + 1}/3...")
                     device = await find_device(name=TARGET_NAME, service=LWP3_SERVICE_UUID, timeout=10.0)
+                    self.log_debug(f"Found device: {device}")
                     break
                 except asyncio.TimeoutError:
+                    self.log_debug(f"Scan attempt {attempt + 1} timed out")
                     if attempt == 2:
                         # Fallback to Bleak
+                        self.log_debug("Trying Bleak fallback...")
                         from bleak import BleakScanner
                         devices = await BleakScanner.discover(timeout=8.0)
                         for d in devices:
                             if getattr(d, 'name', None) == TARGET_NAME:
                                 device = d
+                                self.log_debug(f"Found via Bleak: {device}")
                                 break
             
             if device is None:
                 raise Exception("Could not find Train Base")
             
             # Connect
+            self.log_debug("Creating BLE connection...")
             self.connection = BLEConnection(
                 char_rx_UUID=LWP3_CHAR_UUID,
                 char_tx_UUID=LWP3_CHAR_UUID,
                 max_data_size=20,
             )
+            
+            self.log_debug("Connecting to device...")
             await self.connection.connect(device)
+            self.log_debug("BLE connection established!")
             
             # Set up data handler
             def log_data(sender, data: bytes):
                 self.received_messages.append(data)
+                # Parse color sensor data
+                self.parse_color_sensor_data(data)
                 if self.log_rx.get():
                     self.log_debug(f"RX: {data.hex()} | {self.decode_message(data)}")
             self.connection.data_handler = log_data
@@ -602,6 +577,7 @@ class TrainHubGUI:
             self.root.after(0, self.connection_success)
             
         except Exception as e:
+            self.log_debug(f"Connection error: {e}")
             raise e
     
     async def command_processor(self):
@@ -626,7 +602,12 @@ class TrainHubGUI:
         self.disconnect_btn.config(state=tk.NORMAL)
         self.log_debug("✓ Successfully connected to Train Base")
         self.update_connection_info()
-        messagebox.showinfo("Success", "Connected to Train Base!")
+        
+        # Auto-scan ports on connection
+        self.log_debug("Auto-scanning for attached devices...")
+        self.root.after(500, self.auto_detect_ports)
+        
+        messagebox.showinfo("Success", "Connected to Train Base!\nCheck Debug tab for port detection.")
     
     def connection_failed(self, error):
         self.status_label.config(text="Status: Connection Failed", fg='#f44336')
@@ -639,8 +620,11 @@ class TrainHubGUI:
             self.command_queue.put(None)  # Signal shutdown
             
             # Schedule async disconnect
-            if self.loop:
-                asyncio.run_coroutine_threadsafe(self.async_disconnect(), self.loop)
+            if self.loop and not self.loop.is_closed():
+                try:
+                    asyncio.run_coroutine_threadsafe(self.async_disconnect(), self.loop)
+                except:
+                    pass
             
             self.status_label.config(text="Status: Disconnected", fg='#ff9800')
             self.connect_btn.config(state=tk.NORMAL)
@@ -650,6 +634,7 @@ class TrainHubGUI:
         if self.connection:
             try:
                 await self.connection.disconnect()
+                await asyncio.sleep(0.1)  # Give time for cleanup
             except:
                 pass
     
@@ -668,66 +653,81 @@ class TrainHubGUI:
         return state_map[self.end_state_var.get()]
     
     def start_speed(self):
-        port = self.port_var.get()
+        port = 0  # Always use port 0
         speed = self.speed_var.get()
-        cmd = make_start_speed(
-            port,
-            speed,
-            self.max_power_var.get(),
-            1 if self.use_profile_var.get() else 0
-        )
-        self.send_command(cmd, f"StartSpeed port={port} speed={speed}")
+        
+        if self.use_direct_mode.get():
+            # Use WriteDirectModeData (works better for train motors)
+            cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
+            self.send_command(cmd, f"WriteDirectMode port={port} speed={speed}")
+        else:
+            # Use StartSpeed (for Technic motors)
+            cmd = make_start_speed(
+                port,
+                speed,
+                100,  # max_power always 100
+                0  # use_profile always 0
+            )
+            self.send_command(cmd, f"StartSpeed port={port} speed={speed}")
     
     def stop_motor(self):
-        port = self.port_var.get()
-        cmd = make_start_speed(port, 0, 100, 0)
-        self.send_command(cmd, f"Stop port={port}")
+        port = 0  # Always use port 0
+        if self.use_direct_mode.get():
+            cmd = make_write_direct_mode_data(port, 0x00, 0)
+            self.send_command(cmd, f"WriteDirectMode stop port={port}")
+        else:
+            cmd = make_start_speed(port, 0, 100, 0)
+            self.send_command(cmd, f"Stop port={port}")
     
     def set_quick_speed(self, speed):
         self.speed_var.set(speed)
         self.start_speed()
     
-    def start_power(self):
-        port = self.port_var.get()
-        power = self.power_var.get()
-        cmd = make_start_power(port, power)
-        self.send_command(cmd, f"StartPower port={port} power={power}")
+    def on_instant_speed_change(self, value):
+        """Called when instant speed slider changes"""
+        speed = int(value)
+        
+        # Skip the dead zone (-30 to +30), except for 0
+        if -30 < speed < 30 and speed != 0:
+            # Snap to nearest boundary
+            if speed > 0:
+                speed = 30
+            else:
+                speed = -30
+            self.instant_speed_var.set(speed)
+            return
+        
+        port = 0  # Always use port 0
+        
+        if self.connected:
+            # Send the speed command (including 0 for stop)
+            if self.use_direct_mode.get():
+                cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
+                self.send_command(cmd, f"Instant speed={speed}")
+            else:
+                cmd = make_start_speed(port, speed, 100, 0)
+                self.send_command(cmd, f"Instant speed={speed}")
     
-    def start_speed_for_time(self):
-        cmd = make_start_speed_for_time(
-            self.port_var.get(),
-            self.time_var.get(),
-            self.speed_var.get(),
-            self.max_power_var.get(),
-            self.get_end_state_value(),
-            1 if self.use_profile_var.get() else 0
-        )
-        self.send_command(cmd)
+    def stop_instant_speed(self):
+        """Stop motor and reset instant speed slider to 0"""
+        port = 0  # Always use port 0
+        
+        # Explicitly send stop command
+        if self.connected:
+            if self.use_direct_mode.get():
+                cmd = make_write_direct_mode_data(port, 0x00, 0)
+                self.send_command(cmd, f"Stop (instant speed)")
+            else:
+                cmd = make_start_speed(port, 0, 100, 0)
+                self.send_command(cmd, f"Stop (instant speed)")
+        
+        # Reset slider to 0
+        self.instant_speed_var.set(0)
     
-    def start_speed_for_degrees(self):
-        cmd = make_start_speed_for_degrees(
-            self.port_var.get(),
-            self.degrees_var.get(),
-            self.speed_var.get(),
-            self.max_power_var.get(),
-            self.get_end_state_value(),
-            1 if self.use_profile_var.get() else 0
-        )
-        self.send_command(cmd)
-    
-    def set_acc_profile(self):
-        cmd = make_set_acc_time(self.port_var.get(), self.acc_time_var.get(), 0)
-        self.send_command(cmd)
-        messagebox.showinfo("Profile Set", f"Acceleration profile set to {self.acc_time_var.get()}ms")
-    
-    def set_dec_profile(self):
-        cmd = make_set_dec_time(self.port_var.get(), self.dec_time_var.get(), 0)
-        self.send_command(cmd)
-        messagebox.showinfo("Profile Set", f"Deceleration profile set to {self.dec_time_var.get()}ms")
     
     def set_led_color(self, color):
         cmd = make_hub_led_color(color)
-        self.send_command(cmd)
+        self.send_command(cmd, f"Set LED color={color}")
     
     def shutdown_hub(self):
         if messagebox.askyesno("Confirm", "Are you sure you want to shutdown the hub?"):
@@ -823,6 +823,12 @@ class TrainHubGUI:
             fb_name = feedback_names.get(feedback, f"0x{feedback:02X}")
             return f"{msg_name} Port={port} Feedback={fb_name}"
         
+        elif msg_type == 0x45 and len(data) >= 5:  # PORT_INPUT_FORMAT
+            port = data[3]
+            if len(data) >= 5:
+                value = data[4]
+                return f"{msg_name} Port={port} Value={value}"
+        
         return msg_name
     
     def update_connection_info(self):
@@ -846,8 +852,8 @@ class TrainHubGUI:
             self.send_command(cmd, f"Port info request port={port}")
     
     def request_port_info(self):
-        """Request info for selected port"""
-        port = self.port_var.get()
+        """Request info for port 0"""
+        port = 0  # Always use port 0
         self.log_debug(f"Requesting info for port {port}...")
         # Request different info types
         for info_type in [0x00, 0x01, 0x02]:  # Mode info, combinations, etc.
@@ -856,7 +862,7 @@ class TrainHubGUI:
     
     def test_write_direct(self):
         """Test WriteDirectModeData command"""
-        port = self.port_var.get()
+        port = 0  # Always use port 0
         self.log_debug(f"Testing WriteDirectModeData on port {port}...")
         
         # Try mode 0 with speed 50
@@ -871,6 +877,8 @@ class TrainHubGUI:
     def test_all_ports(self):
         """Test all ports sequentially"""
         self.log_debug("Testing all ports sequentially...")
+        self.log_debug("Watch your train - note which ports make it move!")
+        self.working_ports.clear()
         
         for port in [0, 1, 2]:
             # Test with WriteDirectModeData
@@ -886,6 +894,31 @@ class TrainHubGUI:
                 make_write_direct_mode_data(p, 0x00, 0),
                 f"Test port={p} WriteDirectMode speed=0"
             ))
+        
+        # After all tests, prompt user to mark working ports
+        self.root.after(10000, self.prompt_working_ports)
+    
+    def prompt_working_ports(self):
+        """Ask user which ports worked"""
+        result = messagebox.askquestion(
+            "Port Test Complete",
+            "Did you see the motor move?\n\n"
+            "Based on typical Train Base setup:\n"
+            "• Port 0 and Port 2 usually have motors\n"
+            "• Port 1 is often unused or has a different device\n\n"
+            "Mark Port 0 and Port 2 as working?",
+            icon='question'
+        )
+        
+        if result == 'yes':
+            self.working_ports = {0, 2}
+            self.update_port_status()
+            self.log_debug("✓ Marked Port 0 and Port 2 as working")
+            messagebox.showinfo("Success", "Port 0 and Port 2 marked as working!\nUse these ports for motor control.")
+    
+    def update_port_status(self):
+        """Update port status indicators (no-op since port selection removed)"""
+        pass
     
     def send_raw_command(self):
         """Send raw hex command"""
@@ -898,6 +931,138 @@ class TrainHubGUI:
         except Exception as e:
             self.log_debug(f"ERROR: Invalid hex format - {e}")
             messagebox.showerror("Invalid Format", f"Invalid hex format:\n{e}")
+    
+    def auto_detect_ports(self):
+        """Auto-detect ports on connection"""
+        self.log_debug("=" * 60)
+        self.log_debug("AUTOMATIC PORT DETECTION")
+        self.log_debug("=" * 60)
+        self.log_debug("Waiting for HUB_ATTACHED_IO messages...")
+        self.log_debug("These messages show which ports have motors attached.")
+        self.log_debug("")
+        self.log_debug("If no messages appear, the hub may not send them automatically.")
+        self.log_debug("Try clicking 'Scan All Ports' or 'Test All Ports' buttons.")
+        self.log_debug("=" * 60)
+    
+    def check_rx_handler(self):
+        """Check if RX handler is working"""
+        self.log_debug("=" * 60)
+        self.log_debug("RX HANDLER DIAGNOSTICS")
+        self.log_debug("=" * 60)
+        self.log_debug(f"Connection object: {self.connection}")
+        self.log_debug(f"Connected status: {self.connected}")
+        self.log_debug(f"Received messages count: {len(self.received_messages)}")
+        self.log_debug(f"Log RX enabled: {self.log_rx.get()}")
+        
+        if len(self.received_messages) > 0:
+            self.log_debug(f"\n✓ RX handler IS working! Received {len(self.received_messages)} messages:")
+            for i, msg in enumerate(self.received_messages[-5:]):  # Show last 5
+                self.log_debug(f"  [{i}] {msg.hex()} - {self.decode_message(msg)}")
+        else:
+            self.log_debug("\n⚠ WARNING: No messages received from hub!")
+            self.log_debug("This could mean:")
+            self.log_debug("  1. Hub is not sending feedback (normal for some commands)")
+            self.log_debug("  2. RX notifications are not enabled")
+            self.log_debug("  3. Connection issue")
+            self.log_debug("\nTrying to request hub properties to trigger response...")
+            
+            # Request hub name (should trigger a response)
+            cmd = bytes([0x05, 0x00, 0x01, 0x01, 0x05])  # Request hub name
+            self.send_command(cmd, "Request hub name (diagnostic)")
+            
+            self.log_debug("Sent hub name request. Watch for RX messages above.")
+        
+        self.log_debug("=" * 60)
+    
+    def enable_color_sensor(self):
+        """Enable color sensor notifications"""
+        if not self.connected:
+            messagebox.showwarning("Not Connected", "Please connect to Train Base first!")
+            return
+        
+        port = self.color_sensor_port.get()
+        self.log_debug(f"Enabling color sensor on port {port}...")
+        
+        # Mode 8 is typically the color mode for LEGO color sensors
+        # Delta = 1 means notify on any change
+        cmd = make_port_input_format_setup(port, mode=8, delta=1, notify=True)
+        self.send_command(cmd, f"Enable color sensor port={port} mode=8")
+        
+        self.color_sensor_enabled = True
+        self.enable_color_btn.config(state=tk.DISABLED)
+        self.disable_color_btn.config(state=tk.NORMAL)
+        self.current_color.set("Waiting for data...")
+        self.current_color_value.set(-1)
+        
+        self.log_debug(f"✓ Color sensor enabled on port {port}")
+        self.log_debug("Place colored objects in front of the sensor to see readings.")
+    
+    def disable_color_sensor(self):
+        """Disable color sensor notifications"""
+        if not self.connected:
+            return
+        
+        port = self.color_sensor_port.get()
+        self.log_debug(f"Disabling color sensor on port {port}...")
+        
+        # Set notify to False to disable notifications
+        cmd = make_port_input_format_setup(port, mode=8, delta=1, notify=False)
+        self.send_command(cmd, f"Disable color sensor port={port}")
+        
+        self.color_sensor_enabled = False
+        self.enable_color_btn.config(state=tk.NORMAL)
+        self.disable_color_btn.config(state=tk.DISABLED)
+        self.current_color.set("Disabled")
+        self.current_color_value.set(-1)
+        self.color_display.config(bg='#1e1e1e')
+        self.color_name_label.config(bg='#1e1e1e')
+        
+        self.log_debug(f"✓ Color sensor disabled on port {port}")
+    
+    def parse_color_sensor_data(self, data: bytes):
+        """Parse incoming color sensor data from PORT_VALUE messages"""
+        if not self.color_sensor_enabled:
+            return
+        
+        if len(data) < 5:
+            return
+        
+        msg_type = data[2]
+        
+        # PORT_VALUE (0x45) contains sensor readings
+        if msg_type == 0x45:
+            port = data[3]
+            if port == self.color_sensor_port.get() and len(data) >= 5:
+                color_value = data[4]
+                self.update_color_display(color_value)
+    
+    def update_color_display(self, color_value: int):
+        """Update the color display with the detected color"""
+        color_names = {
+            0: ("Black", "#000000", "#FFFFFF"),
+            1: ("Pink", "#FF69B4", "#000000"),
+            2: ("Purple", "#800080", "#FFFFFF"),
+            3: ("Blue", "#0000FF", "#FFFFFF"),
+            4: ("Light Blue", "#87CEEB", "#000000"),
+            5: ("Cyan", "#00FFFF", "#000000"),
+            6: ("Green", "#00FF00", "#000000"),
+            7: ("Yellow", "#FFFF00", "#000000"),
+            8: ("Orange", "#FFA500", "#000000"),
+            9: ("Red", "#FF0000", "#FFFFFF"),
+            10: ("White", "#FFFFFF", "#000000"),
+        }
+        
+        if color_value in color_names:
+            name, bg_color, fg_color = color_names[color_value]
+            self.current_color.set(name)
+            self.current_color_value.set(color_value)
+            self.color_display.config(bg=bg_color)
+            self.color_name_label.config(bg=bg_color, fg=fg_color)
+        else:
+            self.current_color.set(f"Unknown ({color_value})")
+            self.current_color_value.set(color_value)
+            self.color_display.config(bg='#1e1e1e')
+            self.color_name_label.config(bg='#1e1e1e', fg='#ffffff')
 
 
 def main():
