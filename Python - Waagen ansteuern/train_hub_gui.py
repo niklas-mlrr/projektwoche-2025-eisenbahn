@@ -128,10 +128,19 @@ class TrainHubGUI:
         self.use_direct_mode = tk.BooleanVar(value=True)  # Use WriteDirectModeData by default
         
         # Color sensor variables
-        self.color_sensor_port = tk.IntVar(value=1)  # Default to port 1 for color sensor
+        self.color_sensor_port = tk.IntVar(value=0x12)  # Default to port 0x12 (18) for Train Base color sensor
         self.current_color = tk.StringVar(value="Unknown")
         self.current_color_value = tk.IntVar(value=-1)
         self.color_sensor_enabled = False
+        self.color_sensor_mode = tk.IntVar(value=0)  # 0=Color Index, 3=RGB
+        self._color_last_rx_ms = 0  # timestamp of last color RX (ms)
+        self._color_auto_fallback_pending = False
+        
+        # Color stabilization/debouncing
+        self._color_history = []  # Store recent color readings
+        self._color_history_max = 5  # Number of readings to average
+        self._last_stable_color = -1  # Last confirmed stable color
+        self._color_stability_threshold = 3  # Minimum occurrences to confirm color
         
         # Debug variables
         self.debug_enabled = tk.BooleanVar(value=True)
@@ -412,11 +421,46 @@ class TrainHubGUI:
         tk.Label(port_frame, text="Color Sensor Port:", bg='#2b2b2b', fg='#ffffff',
                 font=('Arial', 10)).pack(side=tk.LEFT, padx=10)
         
-        for port in [0, 1, 2, 3]:
-            tk.Radiobutton(port_frame, text=f"Port {port}", variable=self.color_sensor_port,
+        # Port 0x12 (18) is the built-in color sensor on Train Base
+        port_options = [("Built-in (0x12)", 0x12), ("Port 0", 0), ("Port 1", 1), ("Port 2", 2)]
+        for label, port in port_options:
+            tk.Radiobutton(port_frame, text=label, variable=self.color_sensor_port,
                           value=port, bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
                           font=('Arial', 9), activebackground='#2b2b2b',
                           activeforeground='#ffffff').pack(side=tk.LEFT, padx=5)
+        
+        # Mode selection
+        mode_frame = tk.Frame(port_frame, bg='#2b2b2b')
+        mode_frame.pack(pady=5)
+        tk.Label(mode_frame, text="Mode:", bg='#2b2b2b', fg='#ffffff',
+                font=('Arial', 10)).pack(side=tk.LEFT, padx=10)
+        tk.Radiobutton(mode_frame, text="Color Index (0-10)", variable=self.color_sensor_mode,
+                      value=0, bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
+                      font=('Arial', 9), activebackground='#2b2b2b',
+                      activeforeground='#ffffff').pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(mode_frame, text="RGB Values", variable=self.color_sensor_mode,
+                      value=3, bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
+                      font=('Arial', 9), activebackground='#2b2b2b',
+                      activeforeground='#ffffff').pack(side=tk.LEFT, padx=5)
+        
+        # Stabilization settings
+        stab_frame = tk.LabelFrame(port_frame, text="Stabilization (reduces flickering)", 
+                                   bg='#2b2b2b', fg='#ffffff', font=('Arial', 9))
+        stab_frame.pack(pady=5, padx=10, fill=tk.X)
+        
+        tk.Label(stab_frame, text="Sensitivity:", bg='#2b2b2b', fg='#ffffff',
+                font=('Arial', 9)).pack(side=tk.LEFT, padx=5)
+        
+        # Sensitivity presets
+        tk.Button(stab_frame, text="High (Fast)", 
+                 command=lambda: self._set_stabilization(2, 3),
+                 bg='#607D8B', fg='white', font=('Arial', 8), padx=5, pady=2).pack(side=tk.LEFT, padx=2)
+        tk.Button(stab_frame, text="Medium (Default)", 
+                 command=lambda: self._set_stabilization(3, 5),
+                 bg='#607D8B', fg='white', font=('Arial', 8), padx=5, pady=2).pack(side=tk.LEFT, padx=2)
+        tk.Button(stab_frame, text="Low (Stable)", 
+                 command=lambda: self._set_stabilization(4, 7),
+                 bg='#607D8B', fg='white', font=('Arial', 8), padx=5, pady=2).pack(side=tk.LEFT, padx=2)
         
         # Control buttons
         btn_frame = tk.Frame(port_frame, bg='#2b2b2b')
@@ -433,6 +477,16 @@ class TrainHubGUI:
                                           bg='#f44336', fg='white', font=('Arial', 10, 'bold'),
                                           padx=20, pady=5, state=tk.DISABLED)
         self.disable_color_btn.pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="Test Color Sensor", 
+                 command=self.test_color_sensor,
+                 bg='#2196F3', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=5).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="Scan All Ports for Sensor", 
+                 command=self.scan_all_ports_for_sensor,
+                 bg='#9C27B0', fg='white', font=('Arial', 10, 'bold'),
+                 padx=20, pady=5).pack(side=tk.LEFT, padx=5)
         
         # Color display
         display_frame = tk.LabelFrame(parent, text="Current Color Reading", bg='#2b2b2b',
@@ -455,8 +509,14 @@ class TrainHubGUI:
         
         tk.Label(value_frame, text="Raw Value:", bg='#2b2b2b', fg='#ffffff',
                 font=('Arial', 10)).pack(side=tk.LEFT, padx=5)
-        tk.Label(value_frame, textvariable=self.current_color_value, bg='#2b2b2b',
-                fg='#4CAF50', font=('Arial', 14, 'bold')).pack(side=tk.LEFT, padx=5)
+        self.color_value_label = tk.Label(value_frame, textvariable=self.current_color_value, bg='#2b2b2b',
+                fg='#4CAF50', font=('Arial', 14, 'bold'))
+        self.color_value_label.pack(side=tk.LEFT, padx=5)
+        
+        # Status indicator
+        self.color_status_label = tk.Label(value_frame, text="● Inactive", bg='#2b2b2b',
+                                          fg='#888888', font=('Arial', 10))
+        self.color_status_label.pack(side=tk.LEFT, padx=20)
         
         # Color legend
         legend_frame = tk.LabelFrame(parent, text="Color Values Reference", bg='#2b2b2b',
@@ -564,14 +624,49 @@ class TrainHubGUI:
             await self.connection.connect(device)
             self.log_debug("BLE connection established!")
             
+            # Give the connection a moment to stabilize
+            await asyncio.sleep(0.2)
+            
             # Set up data handler
             def log_data(sender, data: bytes):
                 self.received_messages.append(data)
+                # Always log ALL incoming messages when color sensor is enabled for debugging
+                if self.log_rx.get() or self.color_sensor_enabled:
+                    self.log_debug(f"RX: {data.hex()} | {self.decode_message(data)}")
                 # Parse color sensor data
                 self.parse_color_sensor_data(data)
-                if self.log_rx.get():
-                    self.log_debug(f"RX: {data.hex()} | {self.decode_message(data)}")
+            
+            # CRITICAL: Ensure data handler is set BEFORE any other operations
             self.connection.data_handler = log_data
+            self.log_debug("✓ Data handler installed")
+            
+            # Check if BLE client has notifications enabled
+            try:
+                if hasattr(self.connection, 'client'):
+                    self.log_debug(f"BLE Client: {self.connection.client}")
+                    self.log_debug(f"Connected: {self.connection.client.is_connected}")
+                    # Try to manually enable notifications if not already enabled
+                    try:
+                        await self.connection.client.start_notify(LWP3_CHAR_UUID, log_data)
+                        self.log_debug("✓ Manually enabled BLE notifications")
+                    except Exception as e:
+                        self.log_debug(f"Note: Could not manually enable notifications (may already be enabled): {e}")
+            except Exception as e:
+                self.log_debug(f"Could not access BLE client: {e}")
+            
+            # Test if we can receive data by requesting hub properties
+            self.log_debug("Testing RX by requesting hub name...")
+            test_cmd = bytes([0x05, 0x00, 0x01, 0x01, 0x05])  # Request hub name
+            await self.connection.write(test_cmd)
+            await asyncio.sleep(0.5)  # Wait for response
+            
+            if len(self.received_messages) == 0:
+                self.log_debug("⚠ WARNING: No response to hub name request!")
+                self.log_debug("⚠ BLE notifications may not be enabled properly!")
+                self.log_debug("⚠ The hub is connected but not sending data back!")
+                self.log_debug("⚠ This is a known issue with some pybricksdev versions.")
+            else:
+                self.log_debug(f"✓ RX working! Received {len(self.received_messages)} messages")
             
             self.connected = True
             self.root.after(0, self.connection_success)
@@ -792,8 +887,8 @@ class TrainHubGUI:
             0x21: "PORT_INFO",
             0x43: "PORT_VALUE",
             0x44: "PORT_VALUE_COMBINED",
-            0x45: "PORT_INPUT_FORMAT",
-            0x47: "PORT_INPUT_FORMAT_COMBINED",
+            0x45: "PORT_VALUE_SINGLE",  # This is PORT_VALUE (Single), not PORT_INPUT_FORMAT
+            0x47: "PORT_INPUT_FORMAT",
             0x81: "PORT_OUTPUT_CMD",
             0x82: "PORT_OUTPUT_CMD_FEEDBACK",
         }
@@ -807,8 +902,8 @@ class TrainHubGUI:
             event_name = events.get(event, f"0x{event:02X}")
             if event == 1 and len(data) >= 7:
                 io_type = (data[6] << 8) | data[5]
-                return f"{msg_name} Port={port} Event={event_name} IOType=0x{io_type:04X}"
-            return f"{msg_name} Port={port} Event={event_name}"
+                return f"{msg_name} Port=0x{port:02X} ({port}) Event={event_name} IOType=0x{io_type:04X}"
+            return f"{msg_name} Port=0x{port:02X} ({port}) Event={event_name}"
         
         elif msg_type == 0x82 and len(data) >= 5:  # PORT_OUTPUT_CMD_FEEDBACK
             port = data[3]
@@ -823,11 +918,11 @@ class TrainHubGUI:
             fb_name = feedback_names.get(feedback, f"0x{feedback:02X}")
             return f"{msg_name} Port={port} Feedback={fb_name}"
         
-        elif msg_type == 0x45 and len(data) >= 5:  # PORT_INPUT_FORMAT
+        elif msg_type == 0x45 and len(data) >= 5:  # PORT_VALUE (not PORT_INPUT_FORMAT)
             port = data[3]
             if len(data) >= 5:
                 value = data[4]
-                return f"{msg_name} Port={port} Value={value}"
+                return f"{msg_name} Port=0x{port:02X} Value={value}"
         
         return msg_name
     
@@ -938,7 +1033,13 @@ class TrainHubGUI:
         self.log_debug("AUTOMATIC PORT DETECTION")
         self.log_debug("=" * 60)
         self.log_debug("Waiting for HUB_ATTACHED_IO messages...")
-        self.log_debug("These messages show which ports have motors attached.")
+        self.log_debug("These messages show which ports have motors/sensors attached.")
+        self.log_debug("")
+        self.log_debug("Train Base built-in devices:")
+        self.log_debug("  - Port 0x00 (0): Motor A")
+        self.log_debug("  - Port 0x01 (1): Motor B")
+        self.log_debug("  - Port 0x12 (18): Color Sensor")
+        self.log_debug("  - Port 0x13 (19): Speedometer")
         self.log_debug("")
         self.log_debug("If no messages appear, the hub may not send them automatically.")
         self.log_debug("Try clicking 'Scan All Ports' or 'Test All Ports' buttons.")
@@ -981,21 +1082,31 @@ class TrainHubGUI:
             return
         
         port = self.color_sensor_port.get()
-        self.log_debug(f"Enabling color sensor on port {port}...")
+        mode = self.color_sensor_mode.get()
+        self.log_debug(f"Enabling color sensor on port 0x{port:02X} ({port}) with mode {mode}...")
         
-        # Mode 8 is typically the color mode for LEGO color sensors
+        # Mode 0 = Color Index (0-10), Mode 3 = RGB values
         # Delta = 1 means notify on any change
-        cmd = make_port_input_format_setup(port, mode=8, delta=1, notify=True)
-        self.send_command(cmd, f"Enable color sensor port={port} mode=8")
+        cmd = make_port_input_format_setup(port, mode=mode, delta=1, notify=True)
+        self.log_debug(f"Sending PORT_INPUT_FORMAT_SETUP command: {cmd.hex()}")
+        self.log_debug(f"  Expected format: [length, 0x00, 0x41, port, mode, delta(4 bytes), notify]")
+        self.send_command(cmd, f"Enable color sensor port=0x{port:02X} mode={mode}")
         
         self.color_sensor_enabled = True
         self.enable_color_btn.config(state=tk.DISABLED)
         self.disable_color_btn.config(state=tk.NORMAL)
         self.current_color.set("Waiting for data...")
         self.current_color_value.set(-1)
-        
-        self.log_debug(f"✓ Color sensor enabled on port {port}")
+        try:
+            self.color_status_label.config(text="● Listening", fg="#ff9800")
+        except Exception:
+            pass
+
+        mode_name = "Color Index" if mode == 0 else "RGB"
+        self.log_debug(f"✓ Color sensor enabled on port 0x{port:02X} ({port}) in {mode_name} mode")
         self.log_debug("Place colored objects in front of the sensor to see readings.")
+        # Auto-fallback: if no data within 2 seconds, switch mode and retry
+        self.root.after(2000, self._color_auto_fallback_check)
     
     def disable_color_sensor(self):
         """Disable color sensor notifications"""
@@ -1003,11 +1114,12 @@ class TrainHubGUI:
             return
         
         port = self.color_sensor_port.get()
-        self.log_debug(f"Disabling color sensor on port {port}...")
+        mode = self.color_sensor_mode.get()
+        self.log_debug(f"Disabling color sensor on port 0x{port:02X} ({port})...")
         
         # Set notify to False to disable notifications
-        cmd = make_port_input_format_setup(port, mode=8, delta=1, notify=False)
-        self.send_command(cmd, f"Disable color sensor port={port}")
+        cmd = make_port_input_format_setup(port, mode=mode, delta=1, notify=False)
+        self.send_command(cmd, f"Disable color sensor port=0x{port:02X}")
         
         self.color_sensor_enabled = False
         self.enable_color_btn.config(state=tk.NORMAL)
@@ -1017,24 +1129,217 @@ class TrainHubGUI:
         self.color_display.config(bg='#1e1e1e')
         self.color_name_label.config(bg='#1e1e1e')
         
-        self.log_debug(f"✓ Color sensor disabled on port {port}")
+        try:
+            self.color_status_label.config(text="● Inactive", fg="#888888")
+        except Exception:
+            pass
+        
+        self.log_debug(f"✓ Color sensor disabled on port 0x{port:02X} ({port})")
+
+    def _color_auto_fallback_check(self):
+        """Switch mode automatically if no data was received shortly after enabling."""
+        if not (self.connected and self.color_sensor_enabled):
+            return
+        if self.current_color_value.get() == -1:
+            cur = self.color_sensor_mode.get()
+            alt = 3 if cur == 0 else 0
+            self.log_debug(f"No color data yet. Auto-switching mode {cur} -> {alt} and retrying...")
+            self.color_sensor_mode.set(alt)
+            self.enable_color_sensor()
+    
+    def scan_all_ports_for_sensor(self):
+        """Try to enable color sensor on all possible ports to find the right one"""
+        if not self.connected:
+            messagebox.showwarning("Not Connected", "Please connect to Train Base first!")
+            return
+        
+        self.log_debug("=" * 60)
+        self.log_debug("SCANNING ALL PORTS FOR COLOR SENSOR")
+        self.log_debug("=" * 60)
+        self.log_debug("This will try to enable color sensor notifications on multiple ports.")
+        self.log_debug("Watch for PORT_VALUE messages to identify the correct port.")
+        self.log_debug("")
+        
+        # Try common ports for Train Base
+        test_ports = [0x00, 0x01, 0x02, 0x03, 0x12, 0x13, 0x32, 0x3B, 0x3C]
+        
+        for i, port in enumerate(test_ports):
+            delay = i * 500  # 500ms between each attempt
+            self.root.after(delay, lambda p=port: self._try_enable_port(p))
+        
+        self.log_debug(f"Will test {len(test_ports)} ports: {', '.join(f'0x{p:02X}' for p in test_ports)}")
+        self.log_debug("=" * 60)
+    
+    def _try_enable_port(self, port: int):
+        """Helper to try enabling a specific port"""
+        self.log_debug(f"\n>>> Trying port 0x{port:02X} ({port})...")
+        cmd = make_port_input_format_setup(port, mode=0, delta=1, notify=True)
+        self.send_command(cmd, f"Test enable color sensor port=0x{port:02X}")
+    
+    def test_color_sensor(self):
+        """Test color sensor by requesting port info and checking for data"""
+        if not self.connected:
+            messagebox.showwarning("Not Connected", "Please connect to Train Base first!")
+            return
+        
+        port = self.color_sensor_port.get()
+        self.log_debug("=" * 60)
+        self.log_debug(f"COLOR SENSOR TEST - Port 0x{port:02X} ({port})")
+        self.log_debug("=" * 60)
+        
+        # First, scan for all attached devices
+        self.log_debug("Step 1: Scanning for all attached devices...")
+        self.log_debug("Looking for HUB_ATTACHED_IO (0x04) messages...")
+        self.log_debug("These show which ports have devices attached.")
+        
+        # Request port information
+        self.log_debug(f"\nStep 2: Requesting port info for port 0x{port:02X}...")
+        for info_type in [0x00, 0x01, 0x02]:
+            cmd = make_port_info_request(port, info_type)
+            self.send_command(cmd, f"Port info request type={info_type}")
+        
+        # Try alternate ports if 0x12 doesn't work
+        self.log_debug(f"\nStep 3: Trying alternate common color sensor ports...")
+        for alt_port in [0x00, 0x01, 0x02, 0x03, 0x12, 0x13]:
+            if alt_port != port:
+                cmd = make_port_info_request(alt_port, 0x00)
+                self.send_command(cmd, f"Port info request port=0x{alt_port:02X}")
+        
+        # Try to enable the sensor
+        self.log_debug(f"\nStep 4: Enabling color sensor on port 0x{port:02X}...")
+        self.root.after(2000, self.enable_color_sensor)
+        
+        self.log_debug(f"\nStep 5: Watch for PORT_VALUE_SINGLE (0x45) or PORT_VALUE (0x43) messages above.")
+        self.log_debug(f"Expected port: 0x{port:02X} ({port})")
+        self.log_debug("If you see messages for a DIFFERENT port, update the port selection!")
+        self.log_debug("=" * 60)
     
     def parse_color_sensor_data(self, data: bytes):
         """Parse incoming color sensor data from PORT_VALUE messages"""
-        if not self.color_sensor_enabled:
-            return
-        
-        if len(data) < 5:
+        if len(data) < 3:
             return
         
         msg_type = data[2]
         
-        # PORT_VALUE (0x45) contains sensor readings
-        if msg_type == 0x45:
+        # Accept 0x45 (PORT_VALUE_SINGLE), 0x43 (PORT_VALUE), and 0x47 (PORT_INPUT_FORMAT_SINGLE)
+        if msg_type in (0x43, 0x45, 0x47):
+            if len(data) < 4:
+                return
             port = data[3]
-            if port == self.color_sensor_port.get() and len(data) >= 5:
-                color_value = data[4]
-                self.update_color_display(color_value)
+            
+            # Log all PORT_VALUE messages for debugging (always log to help diagnose issues)
+            self.log_debug(f"PORT_VALUE msg_type=0x{msg_type:02X}: port=0x{port:02X} ({port}), len={len(data)}, data={data.hex()}")
+            
+            # Check if this is from our color sensor port
+            if self.color_sensor_enabled and port == self.color_sensor_port.get():
+                mode = self.color_sensor_mode.get()
+                self.log_debug(f"✓ Color sensor data received! Mode={mode}, Length={len(data)}, Full data: {' '.join(f'{b:02X}' for b in data)}")
+                
+                # Update timestamp for auto-fallback check
+                import time
+                self._color_last_rx_ms = int(time.time() * 1000)
+                
+                try:
+                    self.color_status_label.config(text="● Live", fg="#4CAF50")
+                except Exception:
+                    pass
+                
+                if mode == 0:  # Color Index mode
+                    color_value = None
+                    # Train Base sends 5-byte messages: [05, 00, 45, port, color_value]
+                    # Color value is at byte 4 (last byte)
+                    if len(data) >= 5:
+                        potential_value = data[4]
+                        # Check if it's a valid color (0-10) or 0xFF (no color)
+                        if 0 <= potential_value <= 10:
+                            color_value = potential_value
+                            self.log_debug(f"Parsed color index from byte 4 (Train Base format): {color_value}")
+                        elif potential_value == 0xFF:
+                            self.log_debug(f"No color detected (value=0xFF)")
+                            # Don't update display for 0xFF
+                            color_value = None
+                        else:
+                            # Try byte 6 for Mario/other hubs (7+ byte messages)
+                            if len(data) >= 7 and 0 <= data[6] <= 10:
+                                color_value = data[6]
+                                self.log_debug(f"Parsed color index from byte 6 (Mario format): {color_value}")
+                            else:
+                                self.log_debug(f"Unknown color value at byte 4: {potential_value}")
+                    
+                    if color_value is not None:
+                        # Apply stabilization filter
+                        stable_color = self._stabilize_color(color_value)
+                        if stable_color is not None:
+                            self.log_debug(f"✓ Stable Color Index: {stable_color}")
+                            self.root.after(0, lambda v=stable_color: self.update_color_display(v))
+                    else:
+                        if len(data) >= 5:
+                            self.log_debug(f"⚠ Could not parse color from data: {data.hex()}")
+                        
+                elif mode == 3:  # RGB mode
+                    red = green = blue = None
+                    # Common layout for RGB: 16-bit LE per channel
+                    # Format: [length, hub_id, msg_type, port, R_low, R_high, G_low, G_high, B_low, B_high]
+                    if len(data) >= 10:
+                        red = data[4] | (data[5] << 8)
+                        green = data[6] | (data[7] << 8)
+                        blue = data[8] | (data[9] << 8)
+                        # Scale down from 10-bit (0-1023) to 8-bit (0-255)
+                        red = min(255, red // 4)
+                        green = min(255, green // 4)
+                        blue = min(255, blue // 4)
+                        self.log_debug(f"Parsed RGB (16-bit LE): R={red}, G={green}, B={blue}")
+                    # Packed 8-bit RGB at bytes 4,5,6
+                    elif len(data) >= 7:
+                        red, green, blue = data[4], data[5], data[6]
+                        self.log_debug(f"Parsed RGB (8-bit): R={red}, G={green}, B={blue}")
+                    
+                    if None not in (red, green, blue):
+                        self.log_debug(f"✓ RGB: R={red}, G={green}, B={blue}")
+                        self.root.after(0, lambda r=red, g=green, b=blue: self.update_rgb_display(r, g, b))
+                    else:
+                        self.log_debug(f"⚠ Could not parse RGB from payload")
+    
+    def _set_stabilization(self, threshold: int, history_max: int):
+        """Update stabilization parameters"""
+        self._color_stability_threshold = threshold
+        self._color_history_max = history_max
+        self._color_history.clear()  # Reset history when changing settings
+        self._last_stable_color = -1
+        self.log_debug(f"Stabilization updated: threshold={threshold}, history={history_max}")
+    
+    def _stabilize_color(self, color_value: int) -> int:
+        """
+        Stabilize color readings by requiring multiple consistent readings.
+        This filters out rapid fluctuations and noise.
+        Returns the stable color value, or None if not yet stable.
+        """
+        # Add to history
+        self._color_history.append(color_value)
+        
+        # Keep only recent readings
+        if len(self._color_history) > self._color_history_max:
+            self._color_history.pop(0)
+        
+        # Need enough samples
+        if len(self._color_history) < self._color_stability_threshold:
+            return None
+        
+        # Count occurrences of each color in recent history
+        from collections import Counter
+        color_counts = Counter(self._color_history)
+        
+        # Get most common color and its count
+        most_common_color, count = color_counts.most_common(1)[0]
+        
+        # Only update if we have enough consistent readings
+        if count >= self._color_stability_threshold:
+            # Only return if it's different from last stable color (avoid redundant updates)
+            if most_common_color != self._last_stable_color:
+                self._last_stable_color = most_common_color
+                return most_common_color
+        
+        return None
     
     def update_color_display(self, color_value: int):
         """Update the color display with the detected color"""
@@ -1063,6 +1368,20 @@ class TrainHubGUI:
             self.current_color_value.set(color_value)
             self.color_display.config(bg='#1e1e1e')
             self.color_name_label.config(bg='#1e1e1e', fg='#ffffff')
+    
+    def update_rgb_display(self, red: int, green: int, blue: int):
+        """Update the color display with RGB values"""
+        # Convert RGB to hex color
+        hex_color = f"#{red:02x}{green:02x}{blue:02x}"
+        
+        # Calculate brightness to determine text color
+        brightness = (red * 299 + green * 587 + blue * 114) / 1000
+        text_color = "#000000" if brightness > 128 else "#FFFFFF"
+        
+        self.current_color.set(f"RGB: {red},{green},{blue}")
+        self.current_color_value.set(red)  # Show red value as primary
+        self.color_display.config(bg=hex_color)
+        self.color_name_label.config(bg=hex_color, fg=text_color)
 
 
 def main():
