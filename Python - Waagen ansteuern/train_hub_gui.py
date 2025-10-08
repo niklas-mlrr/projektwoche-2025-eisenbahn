@@ -7,9 +7,9 @@ import asyncio
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from threading import Thread
-from pybricksdev.ble import BLEConnection, find_device
 from typing import Optional
 import queue
+import serial
 from datetime import datetime
 
 # LWP3 Protocol Constants
@@ -113,7 +113,7 @@ class TrainHubGUI:
         self.root.configure(bg='#2b2b2b')
         
         # Connection state
-        self.connection: Optional[BLEConnection] = None
+        self.connection: Optional[object] = None
         self.connected = False
         self.command_queue = queue.Queue()
         self.loop = None
@@ -149,6 +149,26 @@ class TrainHubGUI:
         self.received_messages = []
         self.working_ports = set()  # Track which ports have working motors
         
+        # Arduino serial monitor variables
+        self.arduino_port_var = tk.StringVar(value="COM3")
+        self.arduino_baud_var = tk.IntVar(value=9600)
+        self.arduino_value_var = tk.IntVar(value=0)
+        self.arduino_running = False
+        self.arduino_serial = None
+        self.arduino_thread = None
+        self.arduino_slider = None
+        self.arduino_connect_btn = None
+        self.arduino_disconnect_btn = None
+        self.arduino_value_label = None
+        self._arduino_last_value = 0  # raw value for mapping logic
+        self._speed_accum = 0.0       # fractional accumulator for rate steps
+        self._map_tick_ms = 200       # mapping tick interval (ms) - lighter load
+        self._in_instant_callback = False  # re-entrancy guard for instant speed callback
+        self.enable_arduino_mapping = tk.BooleanVar(value=False)  # opt-in mapping
+        self._mapping_active = False  # whether mapping tick is currently scheduled
+        self._mapping_after_id = None  # Tk after id for mapping tick
+        self._instant_ready = False  # delay instant slider callback until GUI is ready
+
         self.create_widgets()
         
     def create_widgets(self):
@@ -209,6 +229,15 @@ class TrainHubGUI:
         tab4 = tk.Frame(notebook, bg='#2b2b2b')
         notebook.add(tab4, text="Debug & Diagnostics")
         self.create_debug_tab(tab4)
+
+        # Enable instant speed callback after UI has fully initialized
+        def _enable_instant_cb():
+            self._instant_ready = True
+            try:
+                self.instant_slider.config(command=self.on_instant_speed_change)
+            except Exception:
+                pass
+        self.root.after(200, _enable_instant_cb)
         
     def create_basic_motor_tab(self, parent):
         # Info label
@@ -228,11 +257,12 @@ class TrainHubGUI:
         # Create instant speed variable
         self.instant_speed_var = tk.IntVar(value=0)
         
-        instant_slider = tk.Scale(instant_frame, from_=-100, to=100, orient=tk.HORIZONTAL,
-                                 variable=self.instant_speed_var, bg='#3c3c3c', fg='#ffffff',
-                                 highlightthickness=0, length=400, troughcolor='#1e88e5',
-                                 command=self.on_instant_speed_change, resolution=1)
-        instant_slider.pack(pady=5)
+        # Create slider without command to avoid early callbacks during startup
+        self.instant_slider = tk.Scale(instant_frame, from_=-100, to=100, orient=tk.HORIZONTAL,
+                                       variable=self.instant_speed_var, bg='#3c3c3c', fg='#ffffff',
+                                       highlightthickness=0, length=400, troughcolor='#1e88e5',
+                                       resolution=1)
+        self.instant_slider.pack(pady=5)
         
         instant_value_label = tk.Label(instant_frame, textvariable=self.instant_speed_var, 
                                        bg='#2b2b2b', fg='#4CAF50', font=('Arial', 14, 'bold'))
@@ -266,6 +296,46 @@ class TrainHubGUI:
                  bg='#4CAF50', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Stop Motor", command=self.stop_motor,
                  bg='#f44336', fg='white', font=('Arial', 10, 'bold'), padx=15, pady=5).pack(side=tk.LEFT, padx=5)
+        
+        # Arduino Live Value Monitor
+        ar_frame = tk.LabelFrame(parent, text="Arduino Live Value", bg='#2b2b2b', 
+                                 fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
+        ar_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        # Connection controls
+        conn_row = tk.Frame(ar_frame, bg='#2b2b2b')
+        conn_row.pack(fill=tk.X, padx=5, pady=5)
+
+        tk.Label(conn_row, text="Port:", bg='#2b2b2b', fg='#ffffff', font=('Arial', 9)).pack(side=tk.LEFT, padx=(0,5))
+        tk.Entry(conn_row, textvariable=self.arduino_port_var, bg='#3c3c3c', fg='#ffffff', width=10).pack(side=tk.LEFT)
+
+        tk.Label(conn_row, text="Baud:", bg='#2b2b2b', fg='#ffffff', font=('Arial', 9)).pack(side=tk.LEFT, padx=(10,5))
+        tk.Entry(conn_row, textvariable=self.arduino_baud_var, bg='#3c3c3c', fg='#ffffff', width=8).pack(side=tk.LEFT)
+
+        btns = tk.Frame(conn_row, bg='#2b2b2b')
+        btns.pack(side=tk.LEFT, padx=10)
+        self.arduino_connect_btn = tk.Button(btns, text="Connect", command=self.arduino_connect,
+                                             bg='#2196F3', fg='white', font=('Arial', 9, 'bold'), padx=10)
+        self.arduino_connect_btn.pack(side=tk.LEFT, padx=5)
+        self.arduino_disconnect_btn = tk.Button(btns, text="Disconnect", command=self.arduino_disconnect,
+                                                bg='#9E9E9E', fg='white', font=('Arial', 9, 'bold'), padx=10, state=tk.DISABLED)
+        self.arduino_disconnect_btn.pack(side=tk.LEFT, padx=5)
+
+        # Slider indicator and label
+        self.arduino_slider = tk.Scale(ar_frame, from_=0, to=1023, orient=tk.HORIZONTAL,
+                                       variable=self.arduino_value_var, bg='#3c3c3c', fg='#ffffff',
+                                       highlightthickness=0, length=400, troughcolor='#1e88e5', state=tk.DISABLED)
+        self.arduino_slider.pack(pady=5)
+
+        self.arduino_value_label = tk.Label(ar_frame, text="Value: 0", bg='#2b2b2b', fg='#4CAF50', font=('Arial', 12, 'bold'))
+        self.arduino_value_label.pack()
+
+        # Mapping toggle
+        map_row = tk.Frame(ar_frame, bg='#2b2b2b')
+        map_row.pack(fill=tk.X, padx=5, pady=5)
+        tk.Checkbutton(map_row, text="Map to Instant Speed", variable=self.enable_arduino_mapping,
+                       command=self._on_mapping_toggle,
+                       bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5', font=('Arial', 9)).pack(side=tk.LEFT)
         
         
     def create_hub_control_tab(self, parent):
@@ -587,13 +657,18 @@ class TrainHubGUI:
     async def async_connect(self):
         try:
             self.log_debug("Starting connection process...")
+            # Lazy import BLE to avoid any side-effects on GUI startup
+            try:
+                from pybricksdev.ble import BLEConnection as _BLEConnection, find_device as _find_device
+            except Exception as imp_err:
+                raise Exception(f"Failed to import BLE backend: {imp_err}")
             
             # Scan for device
             device = None
             for attempt in range(3):
                 try:
                     self.log_debug(f"Scan attempt {attempt + 1}/3...")
-                    device = await find_device(name=TARGET_NAME, service=LWP3_SERVICE_UUID, timeout=10.0)
+                    device = await _find_device(name=TARGET_NAME, service=LWP3_SERVICE_UUID, timeout=10.0)
                     self.log_debug(f"Found device: {device}")
                     break
                 except asyncio.TimeoutError:
@@ -614,7 +689,7 @@ class TrainHubGUI:
             
             # Connect
             self.log_debug("Creating BLE connection...")
-            self.connection = BLEConnection(
+            self.connection = _BLEConnection(
                 char_rx_UUID=LWP3_CHAR_UUID,
                 char_tx_UUID=LWP3_CHAR_UUID,
                 max_data_size=20,
@@ -780,28 +855,41 @@ class TrainHubGUI:
     
     def on_instant_speed_change(self, value):
         """Called when instant speed slider changes"""
-        speed = int(value)
-        
-        # Skip the dead zone (-30 to +30), except for 0
-        if -30 < speed < 30 and speed != 0:
-            # Snap to nearest boundary
-            if speed > 0:
-                speed = 30
-            else:
-                speed = -30
-            self.instant_speed_var.set(speed)
+        # Prevent recursion due to programmatic set() triggering the callback again
+        if self._in_instant_callback:
             return
-        
-        port = 0  # Always use port 0
-        
-        if self.connected:
-            # Send the speed command (including 0 for stop)
-            if self.use_direct_mode.get():
-                cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
-                self.send_command(cmd, f"Instant speed={speed}")
-            else:
-                cmd = make_start_speed(port, speed, 100, 0)
-                self.send_command(cmd, f"Instant speed={speed}")
+        # Skip early calls during startup
+        if not self._instant_ready:
+            return
+        self._in_instant_callback = True
+        try:
+            speed = int(value)
+            
+            # Skip the dead zone (-30 to +30), except for 0
+            if -30 < speed < 30 and speed != 0:
+                # Snap to nearest boundary
+                if speed > 0:
+                    speed = 30
+                else:
+                    speed = -30
+                # Reflect snapped value on the slider but continue to send command
+                try:
+                    self.instant_speed_var.set(speed)
+                except Exception:
+                    pass
+            
+            port = 0  # Always use port 0
+            
+            if self.connected:
+                # Send the speed command (including 0 for stop)
+                if self.use_direct_mode.get():
+                    cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
+                    self.send_command(cmd, f"Instant speed={speed}")
+                else:
+                    cmd = make_start_speed(port, speed, 100, 0)
+                    self.send_command(cmd, f"Instant speed={speed}")
+        finally:
+            self._in_instant_callback = False
     
     def stop_instant_speed(self):
         """Stop motor and reset instant speed slider to 0"""
@@ -819,6 +907,158 @@ class TrainHubGUI:
         # Reset slider to 0
         self.instant_speed_var.set(0)
     
+    # --- Arduino Serial Monitor ---
+    def arduino_connect(self):
+        if self.arduino_running:
+            return
+        port = self.arduino_port_var.get().strip()
+        baud = int(self.arduino_baud_var.get())
+        try:
+            self.log_debug(f"Connecting to Arduino on {port} @ {baud}...")
+            self.arduino_serial = serial.Serial(port, baudrate=baud, timeout=1)
+            self.arduino_running = True
+            self.arduino_thread = Thread(target=self._arduino_reader_worker, daemon=True)
+            self.arduino_thread.start()
+            if self.arduino_connect_btn and self.arduino_disconnect_btn:
+                self.arduino_connect_btn.config(state=tk.DISABLED)
+                self.arduino_disconnect_btn.config(state=tk.NORMAL, bg='#f44336')
+            self.log_debug("✓ Arduino serial connected")
+        except Exception as e:
+            self.log_debug(f"Arduino connect error: {e}")
+            messagebox.showerror("Arduino", f"Failed to open {port}:\n{e}")
+
+    def arduino_disconnect(self):
+        if not self.arduino_running:
+            return
+        self.log_debug("Disconnecting Arduino serial...")
+        self.arduino_running = False
+        try:
+            if self.arduino_serial and self.arduino_serial.is_open:
+                try:
+                    self.arduino_serial.close()
+                except Exception:
+                    pass
+        finally:
+            self.arduino_serial = None
+        try:
+            if self.arduino_thread:
+                self.arduino_thread.join(timeout=0.5)
+        except Exception:
+            pass
+        if self.arduino_connect_btn and self.arduino_disconnect_btn:
+            self.arduino_connect_btn.config(state=tk.NORMAL)
+            self.arduino_disconnect_btn.config(state=tk.DISABLED, bg='#9E9E9E')
+        self.log_debug("✓ Arduino serial disconnected")
+
+    def _arduino_reader_worker(self):
+        while self.arduino_running and self.arduino_serial:
+            try:
+                line = self.arduino_serial.readline()
+                if not line:
+                    continue
+                s = line.decode(errors='ignore').strip()
+                if not s:
+                    continue
+                # Accept numbers; clip to slider range
+                if s.lstrip('-').isdigit():
+                    value = int(s)
+                else:
+                    # Try to parse leading integer if present
+                    try:
+                        value = int(float(s))
+                    except Exception:
+                        continue
+                display_val = max(0, min(1023, value))
+                # Pass both display (clipped) and raw for mapping
+                self.root.after(0, self._update_arduino_value, display_val, value)
+            except Exception:
+                # Silently ignore transient serial errors
+                continue
+
+    def _update_arduino_value(self, value: int, raw_value: int = None):
+        # Update indicator
+        self.arduino_value_var.set(value)
+        # Store last raw value for mapping (fallback to clipped if raw missing)
+        try:
+            self._arduino_last_value = int(raw_value if raw_value is not None else value)
+        except Exception:
+            self._arduino_last_value = int(value)
+        if self.arduino_slider is not None:
+            try:
+                self.arduino_slider.set(value)
+            except Exception:
+                pass
+        if self.arduino_value_label is not None:
+            self.arduino_value_label.config(text=f"Value: {value}")
+
+    def _mapping_tick(self):
+        # Only run mapping when Arduino is connected and reading
+        try:
+            if not self.enable_arduino_mapping.get():
+                # Stop scheduling if disabled
+                self._mapping_active = False
+                self._mapping_after_id = None
+                return
+            if not self.arduino_running:
+                # Idle: reset accumulator to avoid drift while paused
+                self._speed_accum = 0.0
+                # Continue scheduling; mapping enabled but no data yet
+                # fall through to reschedule at end
+                pass
+            v = self._arduino_last_value
+            # Determine rate (units per second) based on ranges
+            if v >= 729:
+                rate = 5.0
+            elif 681 <= v <= 730:
+                rate = 2.0
+            elif 630 <= v <= 680:
+                rate = 0.0
+            elif 580 <= v <= 629:
+                rate = -2.0
+            else:  # 0..579 and negatives
+                rate = -5.0
+
+            # Double the effect in the specified ranges
+            rate *= 2.0
+
+            # Accumulate fractional steps according to tick interval
+            self._speed_accum += rate * (self._map_tick_ms / 1000.0)
+            if abs(self._speed_accum) >= 1.0:
+                step = int(self._speed_accum)
+                self._speed_accum -= step
+                current = int(self.instant_speed_var.get())
+                new = max(-100, min(100, current + step))
+                if new != current:
+                    # Update the slider and explicitly invoke the handler to send motor command
+                    self.instant_speed_var.set(new)
+                    self.on_instant_speed_change(new)
+        finally:
+            if self.enable_arduino_mapping.get():
+                self._mapping_active = True
+                self._mapping_after_id = self.root.after(self._map_tick_ms, self._mapping_tick)
+            else:
+                self._mapping_active = False
+                self._mapping_after_id = None
+
+    def _on_mapping_toggle(self):
+        # Start or stop scheduling based on checkbox
+        if self.enable_arduino_mapping.get():
+            # Start loop if not already active
+            if not self._mapping_active:
+                self._speed_accum = 0.0
+                self._mapping_active = True
+                self._mapping_after_id = self.root.after(self._map_tick_ms, self._mapping_tick)
+        else:
+            # Cancel scheduled tick if any
+            if self._mapping_after_id is not None:
+                try:
+                    self.root.after_cancel(self._mapping_after_id)
+                except Exception:
+                    pass
+            self._mapping_after_id = None
+            self._mapping_active = False
+            self._speed_accum = 0.0
+
     
     def set_led_color(self, color):
         cmd = make_hub_led_color(color)
@@ -1383,10 +1623,22 @@ class TrainHubGUI:
         self.color_display.config(bg=hex_color)
         self.color_name_label.config(bg=hex_color, fg=text_color)
 
+    def on_close(self):
+        try:
+            self.arduino_disconnect()
+        except Exception:
+            pass
+        try:
+            self.disconnect_hub()
+        except Exception:
+            pass
+        self.root.destroy()
+
 
 def main():
     root = tk.Tk()
     app = TrainHubGUI(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 
 
