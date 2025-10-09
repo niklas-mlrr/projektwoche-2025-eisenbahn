@@ -178,6 +178,11 @@ class TrainHubGUI:
         self._manual_override_until = 0.0  # timestamp until which mapping is suppressed
         self._mapping_update_in_progress = False  # true while mapping updates slider
         self.create_widgets()
+        # Attempt to auto-connect to Arduino shortly after GUI starts
+        try:
+            self.root.after(500, lambda: self.arduino_connect(silent=True))
+        except Exception:
+            pass
         
     def create_widgets(self):
         # Title
@@ -841,7 +846,13 @@ class TrainHubGUI:
     # Command Methods
     def send_command(self, cmd: bytes, description: str = "", *, priority: bool = False, kind: str = "other"):
         if not self.connected:
-            messagebox.showwarning("Not Connected", "Please connect to Train Base first!")
+            # Avoid modal warning spam; just drop when not connected
+            try:
+                if self.log_tx.get():
+                    desc = f" ({description})" if description else ""
+                    self.log_debug(f"Drop (not connected): {cmd.hex()}{desc}")
+            except Exception:
+                pass
             return
         if self.log_tx.get():
             desc = f" ({description})" if description else ""
@@ -1034,6 +1045,15 @@ class TrainHubGUI:
         finally:
             self._in_instant_callback = prev_flag
 
+        # After stopping, resume should use the slider value (30 or user-updated)
+        self._last_instant_speed = None
+        self._last_sent_speed = 0
+        # Clear any pending coalesced speed to avoid stale overwrite on resume
+        try:
+            self._latest_speed_cmd = None
+        except Exception:
+            pass
+
         # Explicitly send stop command
         if self.connected:
             if self.use_direct_mode.get():
@@ -1056,17 +1076,10 @@ class TrainHubGUI:
         sign = 1 if self.instant_direction.get() >= 0 else -1
 
         if getattr(self, '_is_running', False):
-            # Stop
-            if self.connected:
-                if self.use_direct_mode.get():
-                    cmd = make_write_direct_mode_data(port, 0x00, 0)
-                    # Cancel any ongoing direction ramp
-                    self._dir_change_in_progress = False
-                    self.send_command(cmd, "Toggle Stop", priority=True)
-                else:
-                    cmd = make_start_speed(port, 0, 100, 0)
-                    self._dir_change_in_progress = False
-                    self.send_command(cmd, "Toggle Stop", priority=True)
+            # Stop: first set slider to 30 (UI feedback), then send stop (priority)
+            # Also cancel any ongoing direction change ramp.
+            self._dir_change_in_progress = False
+            self.stop_instant_speed()
             self._is_running = False
         else:
             # Start (resume last slider speed if available, otherwise use current slider)
@@ -1082,7 +1095,7 @@ class TrainHubGUI:
             self._last_instant_speed = speed
     
     # --- Arduino Serial Monitor ---
-    def arduino_connect(self):
+    def arduino_connect(self, silent: bool = False):
         if self.arduino_running:
             return
         port = self.arduino_port_var.get().strip()
@@ -1108,7 +1121,8 @@ class TrainHubGUI:
                     pass
         except Exception as e:
             self.log_debug(f"Arduino connect error: {e}")
-            messagebox.showerror("Arduino", f"Failed to open {port}:\n{e}")
+            if not silent:
+                messagebox.showerror("Arduino", f"Failed to open {port}:\n{e}")
 
     def arduino_disconnect(self):
         if not self.arduino_running:
