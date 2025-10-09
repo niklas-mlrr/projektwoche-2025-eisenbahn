@@ -268,7 +268,7 @@ class TrainHubGUI:
                 font=('Arial', 9)).pack()
         
         # Create instant speed variable
-        self.instant_speed_var = tk.IntVar(value=30)
+        self.instant_speed_var = tk.IntVar(value=40)
         
         # Create slider without command to avoid early callbacks during startup
         self.instant_slider = tk.Scale(instant_frame, from_=30, to=100, orient=tk.HORIZONTAL,
@@ -1039,7 +1039,7 @@ class TrainHubGUI:
         prev_flag = self._in_instant_callback
         self._in_instant_callback = True
         try:
-            self.instant_speed_var.set(30)
+            self.instant_speed_var.set(40)
         except Exception:
             pass
         finally:
@@ -1071,8 +1071,8 @@ class TrainHubGUI:
         try:
             magnitude = int(self.instant_speed_var.get())
         except Exception:
-            magnitude = 30
-        magnitude = max(30, min(100, magnitude))
+            magnitude = 40
+        magnitude = max(40, min(100, magnitude))
         sign = 1 if self.instant_direction.get() >= 0 else -1
 
         if getattr(self, '_is_running', False):
