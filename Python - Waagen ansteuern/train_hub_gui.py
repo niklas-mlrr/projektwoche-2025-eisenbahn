@@ -11,6 +11,7 @@ from typing import Optional
 import queue
 import serial
 from datetime import datetime
+import time
 
 # LWP3 Protocol Constants
 LWP3_SERVICE_UUID = "00001623-1212-efde-1623-785feabcd123"
@@ -115,7 +116,9 @@ class TrainHubGUI:
         # Connection state
         self.connection: Optional[object] = None
         self.connected = False
-        self.command_queue = queue.Queue()
+        self.command_queue = queue.Queue()        # normal-priority commands
+        self.priority_queue = queue.Queue()       # high-priority commands (STOP/DIR)
+        self._latest_speed_cmd = None             # tuple(cmd_bytes, desc) coalesced latest speed
         self.loop = None
         self.async_thread = None
         
@@ -150,7 +153,7 @@ class TrainHubGUI:
         self.working_ports = set()  # Track which ports have working motors
         
         # Arduino serial monitor variables
-        self.arduino_port_var = tk.StringVar(value="COM3")
+        self.arduino_port_var = tk.StringVar(value="COM15")
         self.arduino_baud_var = tk.IntVar(value=9600)
         self.arduino_value_var = tk.IntVar(value=0)
         self.arduino_running = False
@@ -164,11 +167,16 @@ class TrainHubGUI:
         self._speed_accum = 0.0       # fractional accumulator for rate steps
         self._map_tick_ms = 200       # mapping tick interval (ms) - lighter load
         self._in_instant_callback = False  # re-entrancy guard for instant speed callback
-        self.enable_arduino_mapping = tk.BooleanVar(value=False)  # opt-in mapping
         self._mapping_active = False  # whether mapping tick is currently scheduled
         self._mapping_after_id = None  # Tk after id for mapping tick
         self._instant_ready = False  # delay instant slider callback until GUI is ready
-
+        self._dir_change_in_progress = False  # guard to avoid overlapping direction changes
+        self._is_running = False  # start/stop state for instant control
+        self._last_instant_speed = None  # signed last speed sent by instant slider
+        self._last_sent_speed = None  # last speed actually transmitted to hub
+        self._instant_send_after_id = None  # after() id for coalescing slider sends
+        self._manual_override_until = 0.0  # timestamp until which mapping is suppressed
+        self._mapping_update_in_progress = False  # true while mapping updates slider
         self.create_widgets()
         
     def create_widgets(self):
@@ -251,14 +259,14 @@ class TrainHubGUI:
                                      fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
         instant_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        tk.Label(instant_frame, text="Speed: -100 to 100 (changes instantly, skips -30 to +30)", bg='#2b2b2b', fg='#ffffff',
+        tk.Label(instant_frame, text="Speed: +30 to +100 (instant)", bg='#2b2b2b', fg='#ffffff',
                 font=('Arial', 9)).pack()
         
         # Create instant speed variable
-        self.instant_speed_var = tk.IntVar(value=0)
+        self.instant_speed_var = tk.IntVar(value=30)
         
         # Create slider without command to avoid early callbacks during startup
-        self.instant_slider = tk.Scale(instant_frame, from_=-100, to=100, orient=tk.HORIZONTAL,
+        self.instant_slider = tk.Scale(instant_frame, from_=30, to=100, orient=tk.HORIZONTAL,
                                        variable=self.instant_speed_var, bg='#3c3c3c', fg='#ffffff',
                                        highlightthickness=0, length=400, troughcolor='#1e88e5',
                                        resolution=1)
@@ -268,8 +276,14 @@ class TrainHubGUI:
                                        bg='#2b2b2b', fg='#4CAF50', font=('Arial', 14, 'bold'))
         instant_value_label.pack()
         
-        # Stop button
-        tk.Button(instant_frame, text="Stop", command=self.stop_instant_speed,
+        # Direction toggle
+        self.instant_direction = tk.IntVar(value=1)  # 1 = forward, -1 = reverse
+        self.direction_btn = tk.Button(instant_frame, text="Change of direction", command=self.toggle_instant_direction,
+                                       bg='#607D8B', fg='white', font=('Arial', 10, 'bold'), padx=20, pady=5)
+        self.direction_btn.pack(pady=5)
+        
+        # Start/Stop toggle button
+        tk.Button(instant_frame, text="Start / Stop", command=self.toggle_instant_start_stop,
                  bg='#f44336', fg='white', font=('Arial', 10, 'bold'), padx=30, pady=5).pack(pady=5)
         
         # Speed Control with Button
@@ -329,13 +343,7 @@ class TrainHubGUI:
 
         self.arduino_value_label = tk.Label(ar_frame, text="Value: 0", bg='#2b2b2b', fg='#4CAF50', font=('Arial', 12, 'bold'))
         self.arduino_value_label.pack()
-
-        # Mapping toggle
-        map_row = tk.Frame(ar_frame, bg='#2b2b2b')
-        map_row.pack(fill=tk.X, padx=5, pady=5)
-        tk.Checkbutton(map_row, text="Map to Instant Speed", variable=self.enable_arduino_mapping,
-                       command=self._on_mapping_toggle,
-                       bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5', font=('Arial', 9)).pack(side=tk.LEFT)
+        # Mapping is always enabled when Arduino is connected
         
         
     def create_hub_control_tab(self, parent):
@@ -751,18 +759,40 @@ class TrainHubGUI:
             raise e
     
     async def command_processor(self):
-        """Process commands from the queue"""
+        """Process commands with priority and latest-speed coalescing."""
         while self.connected:
             try:
-                # Check for commands with timeout
+                # 1) Drain priority queue immediately (e.g., STOP/DIR)
                 try:
-                    cmd = self.command_queue.get(timeout=0.1)
-                    if cmd is None:  # Shutdown signal
-                        break
-                    await self.connection.write(cmd)
+                    while True:
+                        item = self.priority_queue.get_nowait()
+                        if item is None:
+                            return
+                        cmd, _desc = item
+                        await self.connection.write(cmd)
                 except queue.Empty:
                     pass
-                await asyncio.sleep(0.01)
+
+                # 2) Send latest speed command if pending, then loop again to re-check priority
+                if self._latest_speed_cmd is not None:
+                    cmd, _desc = self._latest_speed_cmd
+                    self._latest_speed_cmd = None
+                    await self.connection.write(cmd)
+                    # Go back to top to give priority commands a chance
+                    continue
+
+                # 3) Fallback to normal queue with short wait
+                try:
+                    item = self.command_queue.get(timeout=0.02)
+                    if item is None:  # Shutdown signal
+                        break
+                    if isinstance(item, tuple):
+                        cmd, _desc = item
+                    else:
+                        cmd = item
+                    await self.connection.write(cmd)
+                except queue.Empty:
+                    await asyncio.sleep(0.001)
             except Exception as e:
                 print(f"Command error: {e}")
     
@@ -809,14 +839,20 @@ class TrainHubGUI:
                 pass
     
     # Command Methods
-    def send_command(self, cmd: bytes, description: str = ""):
+    def send_command(self, cmd: bytes, description: str = "", *, priority: bool = False, kind: str = "other"):
         if not self.connected:
             messagebox.showwarning("Not Connected", "Please connect to Train Base first!")
             return
         if self.log_tx.get():
             desc = f" ({description})" if description else ""
             self.log_debug(f"TX: {cmd.hex()}{desc}")
-        self.command_queue.put(cmd)
+        if priority:
+            self.priority_queue.put((cmd, description))
+            return
+        if kind == "speed":
+            self._latest_speed_cmd = (cmd, description)
+            return
+        self.command_queue.put((cmd, description))
     
     def get_end_state_value(self) -> int:
         state_map = {"Float": 0, "Hold": 126, "Brake": 127}
@@ -854,58 +890,196 @@ class TrainHubGUI:
         self.start_speed()
     
     def on_instant_speed_change(self, value):
-        """Called when instant speed slider changes"""
-        # Prevent recursion due to programmatic set() triggering the callback again
-        if self._in_instant_callback:
-            return
+        """Called when instant speed slider changes. Send immediately and record state."""
         # Skip early calls during startup
         if not self._instant_ready:
             return
+        # When user moves the slider, briefly suppress mapping interference
+        if not self._mapping_update_in_progress:
+            self._manual_override_until = time.monotonic() + 0.4
+
+        if self._in_instant_callback:
+            return
         self._in_instant_callback = True
         try:
-            speed = int(value)
-            
-            # Skip the dead zone (-30 to +30), except for 0
-            if -30 < speed < 30 and speed != 0:
-                # Snap to nearest boundary
-                if speed > 0:
-                    speed = 30
-                else:
-                    speed = -30
-                # Reflect snapped value on the slider but continue to send command
-                try:
-                    self.instant_speed_var.set(speed)
-                except Exception:
-                    pass
-            
-            port = 0  # Always use port 0
-            
-            if self.connected:
-                # Send the speed command (including 0 for stop)
+            try:
+                magnitude = int(self.instant_speed_var.get())
+            except Exception:
+                magnitude = 30
+            magnitude = max(30, min(100, magnitude))
+            sign = 1 if self.instant_direction.get() >= 0 else -1
+            speed = magnitude * sign
+            port = 0
+            # Avoid duplicate sends
+            if self.connected and speed != self._last_sent_speed:
                 if self.use_direct_mode.get():
                     cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
-                    self.send_command(cmd, f"Instant speed={speed}")
+                    self.send_command(cmd, f"Instant speed={speed}", kind="speed")
                 else:
                     cmd = make_start_speed(port, speed, 100, 0)
-                    self.send_command(cmd, f"Instant speed={speed}")
+                    self.send_command(cmd, f"Instant speed={speed}", kind="speed")
+                self._last_sent_speed = speed
+                self._is_running = True
+                self._last_instant_speed = speed
         finally:
             self._in_instant_callback = False
+
+    def toggle_instant_direction(self):
+        """Toggle direction with a quick 2s decel/accel ramp (1s down to 0, 1s up)."""
+        if self._dir_change_in_progress:
+            return
+        # Determine current magnitude from slider (30..100)
+        try:
+            magnitude = int(self.instant_speed_var.get())
+        except Exception:
+            magnitude = 30
+        magnitude = max(30, min(100, magnitude))
+
+        # Flip target direction
+        try:
+            current_dir = int(self.instant_direction.get())
+        except Exception:
+            current_dir = 1
+        before_sign = 1 if current_dir >= 0 else -1
+        after_sign = -before_sign
+
+        # If currently stopped, just toggle direction variable without sending
+        if not getattr(self, '_is_running', False):
+            self.instant_direction.set(after_sign)
+            return
+        # If not connected, just toggle direction variable and exit
+        if not self.connected:
+            self.instant_direction.set(after_sign)
+            return
+
+        # Deterministic Stop -> short dwell -> Start in opposite direction
+        self._dir_change_in_progress = True
+        # Update target direction immediately for subsequent actions
+        self.instant_direction.set(after_sign)
+        target_speed = magnitude * after_sign
+        self._last_instant_speed = target_speed
+
+        # Disable button during change
+        if hasattr(self, 'direction_btn') and self.direction_btn is not None:
+            try:
+                self.direction_btn.config(state=tk.DISABLED)
+            except Exception:
+                pass
+
+        port = 0
+        # Step 1: immediate STOP (priority)
+        if self.use_direct_mode.get():
+            stop_cmd = make_write_direct_mode_data(port, 0x00, 0)
+        else:
+            stop_cmd = make_start_speed(port, 0, 100, 0)
+        self.send_command(stop_cmd, "DirChange stop", priority=True)
+        self._last_sent_speed = 0
+        self._is_running = False
+        # Clear any queued coalesced speed that could fight the change
+        self._latest_speed_cmd = None
+
+        # Step 2: start with new sign after a short dwell
+        def _start_new_dir():
+            try:
+                if not self.connected:
+                    return
+                # If a Stop occurred during dwell, abort
+                if not getattr(self, '_dir_change_in_progress', False):
+                    return
+                spd = target_speed
+                if self.use_direct_mode.get():
+                    cmd = make_write_direct_mode_data(port, 0x00, spd if spd >= 0 else (spd + 256))
+                    self.send_command(cmd, f"DirChange start spd={spd}", priority=True)
+                else:
+                    cmd = make_start_speed(port, spd, 100, 0)
+                    self.send_command(cmd, f"DirChange start spd={spd}", priority=True)
+                self._last_sent_speed = spd
+                self._is_running = True
+                # Backup resend once to mitigate potential BLE drops
+                def _backup_send():
+                    try:
+                        if not self.connected or not self._is_running:
+                            return
+                        if self.use_direct_mode.get():
+                            bcmd = make_write_direct_mode_data(port, 0x00, spd if spd >= 0 else (spd + 256))
+                            self.send_command(bcmd, f"DirChange backup spd={spd}", priority=True)
+                        else:
+                            bcmd = make_start_speed(port, spd, 100, 0)
+                            self.send_command(bcmd, f"DirChange backup spd={spd}", priority=True)
+                        self._last_sent_speed = spd
+                    except Exception:
+                        pass
+                self.root.after(200, _backup_send)
+            finally:
+                self._dir_change_in_progress = False
+                if hasattr(self, 'direction_btn') and self.direction_btn is not None:
+                    try:
+                        self.direction_btn.config(state=tk.NORMAL)
+                    except Exception:
+                        pass
+
+        self.root.after(80, _start_new_dir)
     
     def stop_instant_speed(self):
-        """Stop motor and reset instant speed slider to 0"""
+        """Set slider to 30 and stop motor"""
         port = 0  # Always use port 0
         
+        # Set slider to 30 without triggering the instant callback
+        prev_flag = self._in_instant_callback
+        self._in_instant_callback = True
+        try:
+            self.instant_speed_var.set(30)
+        except Exception:
+            pass
+        finally:
+            self._in_instant_callback = prev_flag
+
         # Explicitly send stop command
         if self.connected:
             if self.use_direct_mode.get():
                 cmd = make_write_direct_mode_data(port, 0x00, 0)
-                self.send_command(cmd, f"Stop (instant speed)")
+                self.send_command(cmd, f"Stop (instant speed)", priority=True)
             else:
                 cmd = make_start_speed(port, 0, 100, 0)
-                self.send_command(cmd, f"Stop (instant speed)")
-        
-        # Reset slider to 0
-        self.instant_speed_var.set(0)
+                self.send_command(cmd, f"Stop (instant speed)", priority=True)
+        # Do not change the slider value; keep last magnitude
+
+    def toggle_instant_start_stop(self):
+        """Toggle between starting and stopping the instant control speed."""
+        port = 0  # Always use port 0
+        # Determine magnitude and sign
+        try:
+            magnitude = int(self.instant_speed_var.get())
+        except Exception:
+            magnitude = 30
+        magnitude = max(30, min(100, magnitude))
+        sign = 1 if self.instant_direction.get() >= 0 else -1
+
+        if getattr(self, '_is_running', False):
+            # Stop
+            if self.connected:
+                if self.use_direct_mode.get():
+                    cmd = make_write_direct_mode_data(port, 0x00, 0)
+                    # Cancel any ongoing direction ramp
+                    self._dir_change_in_progress = False
+                    self.send_command(cmd, "Toggle Stop", priority=True)
+                else:
+                    cmd = make_start_speed(port, 0, 100, 0)
+                    self._dir_change_in_progress = False
+                    self.send_command(cmd, "Toggle Stop", priority=True)
+            self._is_running = False
+        else:
+            # Start (resume last slider speed if available, otherwise use current slider)
+            speed = self._last_instant_speed if (self._last_instant_speed is not None and self._last_instant_speed != 0) else (magnitude * sign)
+            if self.connected:
+                if self.use_direct_mode.get():
+                    cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
+                    self.send_command(cmd, f"Toggle Start speed={speed}", kind="speed")
+                else:
+                    cmd = make_start_speed(port, speed, 100, 0)
+                    self.send_command(cmd, f"Toggle Start speed={speed}", kind="speed")
+            self._is_running = True
+            self._last_instant_speed = speed
     
     # --- Arduino Serial Monitor ---
     def arduino_connect(self):
@@ -923,6 +1097,15 @@ class TrainHubGUI:
                 self.arduino_connect_btn.config(state=tk.DISABLED)
                 self.arduino_disconnect_btn.config(state=tk.NORMAL, bg='#f44336')
             self.log_debug("✓ Arduino serial connected")
+            # Start flex sensor mapping loop if not already active
+            if not self._mapping_active:
+                self._speed_accum = 0.0
+                self._mapping_active = True
+                try:
+                    # Kick off mapping immediately; it will reschedule itself
+                    self._mapping_tick()
+                except Exception:
+                    pass
         except Exception as e:
             self.log_debug(f"Arduino connect error: {e}")
             messagebox.showerror("Arduino", f"Failed to open {port}:\n{e}")
@@ -945,6 +1128,15 @@ class TrainHubGUI:
                 self.arduino_thread.join(timeout=0.5)
         except Exception:
             pass
+        # Stop mapping loop
+        try:
+            if getattr(self, '_mapping_after_id', None) is not None:
+                self.root.after_cancel(self._mapping_after_id)
+        except Exception:
+            pass
+        self._mapping_active = False
+        self._mapping_after_id = None
+        self._speed_accum = 0.0
         if self.arduino_connect_btn and self.arduino_disconnect_btn:
             self.arduino_connect_btn.config(state=tk.NORMAL)
             self.arduino_disconnect_btn.config(state=tk.DISABLED, bg='#9E9E9E')
@@ -958,6 +1150,19 @@ class TrainHubGUI:
                     continue
                 s = line.decode(errors='ignore').strip()
                 if not s:
+                    continue
+                # Handle button commands from Arduino
+                if s.upper() == "STOP":
+                    try:
+                        self.root.after(0, self.toggle_instant_start_stop)
+                    except Exception:
+                        pass
+                    continue
+                if s.upper() == "DIR":
+                    try:
+                        self.root.after(0, self.toggle_instant_direction)
+                    except Exception:
+                        pass
                     continue
                 # Accept numbers; clip to slider range
                 if s.lstrip('-').isdigit():
@@ -994,17 +1199,16 @@ class TrainHubGUI:
     def _mapping_tick(self):
         # Only run mapping when Arduino is connected and reading
         try:
-            if not self.enable_arduino_mapping.get():
-                # Stop scheduling if disabled
-                self._mapping_active = False
-                self._mapping_after_id = None
-                return
             if not self.arduino_running:
                 # Idle: reset accumulator to avoid drift while paused
                 self._speed_accum = 0.0
-                # Continue scheduling; mapping enabled but no data yet
-                # fall through to reschedule at end
-                pass
+                return
+            # Skip mapping while a direction change sequence is active
+            if getattr(self, '_dir_change_in_progress', False):
+                return
+            # While the user is actively moving the slider, skip mapping
+            if time.monotonic() < self._manual_override_until:
+                return
             v = self._arduino_last_value
             # Determine rate (units per second) based on ranges
             if v >= 729:
@@ -1027,13 +1231,17 @@ class TrainHubGUI:
                 step = int(self._speed_accum)
                 self._speed_accum -= step
                 current = int(self.instant_speed_var.get())
-                new = max(-100, min(100, current + step))
+                new = max(30, min(100, current + step))
                 if new != current:
                     # Update the slider and explicitly invoke the handler to send motor command
-                    self.instant_speed_var.set(new)
-                    self.on_instant_speed_change(new)
+                    self._mapping_update_in_progress = True
+                    try:
+                        self.instant_speed_var.set(new)
+                        self.on_instant_speed_change(new)
+                    finally:
+                        self._mapping_update_in_progress = False
         finally:
-            if self.enable_arduino_mapping.get():
+            if self.arduino_running:
                 self._mapping_active = True
                 self._mapping_after_id = self.root.after(self._map_tick_ms, self._mapping_tick)
             else:
@@ -1041,23 +1249,8 @@ class TrainHubGUI:
                 self._mapping_after_id = None
 
     def _on_mapping_toggle(self):
-        # Start or stop scheduling based on checkbox
-        if self.enable_arduino_mapping.get():
-            # Start loop if not already active
-            if not self._mapping_active:
-                self._speed_accum = 0.0
-                self._mapping_active = True
-                self._mapping_after_id = self.root.after(self._map_tick_ms, self._mapping_tick)
-        else:
-            # Cancel scheduled tick if any
-            if self._mapping_after_id is not None:
-                try:
-                    self.root.after_cancel(self._mapping_after_id)
-                except Exception:
-                    pass
-            self._mapping_after_id = None
-            self._mapping_active = False
-            self._speed_accum = 0.0
+        # Deprecated: mapping is always active while Arduino is connected
+        pass
 
     
     def set_led_color(self, color):
