@@ -111,6 +111,14 @@ class TrainHubGUI:
         self.root = root
         self.root.title("LEGO Train Hub Control Center")
         self.root.geometry("900x800")
+        # Start maximized (windowed fullscreen with title bar and controls)
+        try:
+            self.root.state('zoomed')  # Windows
+        except Exception:
+            try:
+                self.root.attributes('-zoomed', True)  # Some Tk variants
+            except Exception:
+                pass
         self.root.configure(bg='#2b2b2b')
         
         # Connection state
@@ -135,7 +143,7 @@ class TrainHubGUI:
         self.current_color = tk.StringVar(value="Unknown")
         self.current_color_value = tk.IntVar(value=-1)
         self.color_sensor_enabled = False
-        self.color_sensor_mode = tk.IntVar(value=0)  # 0=Color Index, 3=RGB
+        self.color_sensor_mode = tk.IntVar(value=3)  # Default to RGB (3)
         self._color_last_rx_ms = 0  # timestamp of last color RX (ms)
         self._color_auto_fallback_pending = False
         
@@ -189,11 +197,18 @@ class TrainHubGUI:
         self._yellow_required_seconds = 0.15
         self._yellow_cooldown_seconds = 1.0
         self._yellow_post_resume_seconds = 1.0  # block triggers for this long after resuming motion
+        self._yellow_post_resume_block_until_s = 0.0  # monotonic seconds until which post-resume block is active
         self._yellow_indicator_state = "idle"  # UI indicator state: idle/detecting/triggered
         self.create_widgets()
         # Attempt to auto-connect to Arduino shortly after GUI starts
         try:
             self.root.after(500, lambda: self.arduino_connect(silent=True))
+        except Exception:
+            pass
+        # Attempt to auto-connect to Train Base shortly after GUI starts
+        try:
+            # Schedule after UI settles; guard to avoid duplicate connects
+            self.root.after(800, lambda: (None if self.connected else self.connect_hub()))
         except Exception:
             pass
         
@@ -828,6 +843,13 @@ class TrainHubGUI:
         # Auto-scan ports on connection
         self.log_debug("Auto-scanning for attached devices...")
         self.root.after(500, self.auto_detect_ports)
+        # Ensure color mode is RGB and auto-enable color sensor shortly after connect
+        try:
+            self.color_sensor_mode.set(3)
+        except Exception:
+            pass
+        # Schedule enabling to allow connection to settle
+        self.root.after(700, lambda: self.enable_color_sensor())
         
         # Removed modal success popup; Debug tab shows details
     
@@ -890,6 +912,7 @@ class TrainHubGUI:
         port = 0  # Always use port 0
         speed = self.speed_var.get()
         
+        prev_last = self._last_sent_speed
         if self.use_direct_mode.get():
             # Use WriteDirectModeData (works better for train motors)
             cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
@@ -905,6 +928,12 @@ class TrainHubGUI:
             )
             self.send_command(cmd, f"StartSpeed port={port} speed={speed}")
             self._last_sent_speed = speed
+        # If we were stopped and now starting, set post-resume block window
+        try:
+            if (prev_last is None or prev_last == 0) and speed != 0:
+                self._yellow_post_resume_block_until_s = time.monotonic() + self._yellow_post_resume_seconds
+        except Exception:
+            pass
     
     def stop_motor(self):
         port = 0  # Always use port 0
@@ -1270,7 +1299,7 @@ class TrainHubGUI:
                 rate = -5.0
 
             # Double the effect in the specified ranges
-            rate *= 2.0
+            rate *= 3.0
 
             # Accumulate fractional steps according to tick interval
             self._speed_accum += rate * (self._map_tick_ms / 1000.0)
@@ -1595,7 +1624,8 @@ class TrainHubGUI:
             self.log_debug(
                 f"Yellow trigger config: R=[{self._yellow_r_min},{self._yellow_r_max}], "
                 f"G=[{self._yellow_g_min},{self._yellow_g_max}], B=[{self._yellow_b_min},{self._yellow_b_max}], "
-                f"required={self._yellow_required_seconds:.2f}s, cooldown={self._yellow_cooldown_seconds:.2f}s"
+                f"required={self._yellow_required_seconds:.2f}s, cooldown={self._yellow_cooldown_seconds:.2f}s, "
+                f"post_resume_block={self._yellow_post_resume_seconds:.2f}s"
             )
         except Exception:
             pass
@@ -1933,6 +1963,11 @@ class TrainHubGUI:
             return
 
         now = time.monotonic()
+        # Post-resume block: keep scanning/UI, but do not allow triggers
+        if now < self._yellow_post_resume_block_until_s:
+            self._yellow_start_s = None
+            self._set_yellow_indicator('idle')
+            return
         # Cooldown to prevent rapid retriggering
         if now < self._yellow_cooldown_until_s:
             self._yellow_start_s = None
@@ -2008,6 +2043,11 @@ class TrainHubGUI:
                     cmd = make_start_speed(port, speed, 100, 0)
                 self.send_command(cmd, "Auto RESUME (Yellow)", priority=True)
                 self._last_sent_speed = speed
+                # Start post-resume block window
+                try:
+                    self._yellow_post_resume_block_until_s = time.monotonic() + self._yellow_post_resume_seconds
+                except Exception:
+                    pass
             finally:
                 self._auto_stop_in_progress = False
                 # Back to idle after resume
