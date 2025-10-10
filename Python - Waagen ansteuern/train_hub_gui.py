@@ -177,6 +177,19 @@ class TrainHubGUI:
         self._instant_send_after_id = None  # after() id for coalescing slider sends
         self._manual_override_until = 0.0  # timestamp until which mapping is suppressed
         self._mapping_update_in_progress = False  # true while mapping updates slider
+        # RGB trigger logic (Yellow stop/resume)
+        self._yellow_start_s = None  # monotonic seconds when yellow first detected
+        self._yellow_cooldown_until_s = 0.0  # monotonic seconds until which retrigger is blocked
+        self._auto_stop_in_progress = False  # true while auto stop/resume cycle is running
+        self._resume_speed_after_stop = None  # speed to resume after the stop
+        # Thresholds for yellow in 8-bit RGB (post-scaled)
+        self._yellow_r_min, self._yellow_r_max = 245, 256
+        self._yellow_g_min, self._yellow_g_max = 245, 256
+        self._yellow_b_min, self._yellow_b_max = 50, 70
+        self._yellow_required_seconds = 0.15
+        self._yellow_cooldown_seconds = 1.0
+        self._yellow_post_resume_seconds = 1.0  # block triggers for this long after resuming motion
+        self._yellow_indicator_state = "idle"  # UI indicator state: idle/detecting/triggered
         self.create_widgets()
         # Attempt to auto-connect to Arduino shortly after GUI starts
         try:
@@ -600,6 +613,10 @@ class TrainHubGUI:
         self.color_status_label = tk.Label(value_frame, text="● Inactive", bg='#2b2b2b',
                                           fg='#888888', font=('Arial', 10))
         self.color_status_label.pack(side=tk.LEFT, padx=20)
+        # Yellow detection indicator (small status label)
+        self.yellow_indicator_label = tk.Label(value_frame, text="Yellow: idle", bg='#2b2b2b',
+                                              fg='#888888', font=('Arial', 10))
+        self.yellow_indicator_label.pack(side=tk.LEFT, padx=20)
         
         # Color legend
         legend_frame = tk.LabelFrame(parent, text="Color Values Reference", bg='#2b2b2b',
@@ -812,7 +829,7 @@ class TrainHubGUI:
         self.log_debug("Auto-scanning for attached devices...")
         self.root.after(500, self.auto_detect_ports)
         
-        messagebox.showinfo("Success", "Connected to Train Base!\nCheck Debug tab for port detection.")
+        # Removed modal success popup; Debug tab shows details
     
     def connection_failed(self, error):
         self.status_label.config(text="Status: Connection Failed", fg='#f44336')
@@ -877,6 +894,7 @@ class TrainHubGUI:
             # Use WriteDirectModeData (works better for train motors)
             cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
             self.send_command(cmd, f"WriteDirectMode port={port} speed={speed}")
+            self._last_sent_speed = speed
         else:
             # Use StartSpeed (for Technic motors)
             cmd = make_start_speed(
@@ -886,15 +904,18 @@ class TrainHubGUI:
                 0  # use_profile always 0
             )
             self.send_command(cmd, f"StartSpeed port={port} speed={speed}")
+            self._last_sent_speed = speed
     
     def stop_motor(self):
         port = 0  # Always use port 0
         if self.use_direct_mode.get():
             cmd = make_write_direct_mode_data(port, 0x00, 0)
             self.send_command(cmd, f"WriteDirectMode stop port={port}")
+            self._last_sent_speed = 0
         else:
             cmd = make_start_speed(port, 0, 100, 0)
             self.send_command(cmd, f"Stop port={port}")
+            self._last_sent_speed = 0
     
     def set_quick_speed(self, speed):
         self.speed_var.set(speed)
@@ -921,6 +942,18 @@ class TrainHubGUI:
             sign = 1 if self.instant_direction.get() >= 0 else -1
             speed = magnitude * sign
             port = 0
+            # If slider is at minimum (30), treat as STOP instead of speed 30
+            if magnitude <= 30:
+                if self.connected and self._last_sent_speed != 0:
+                    if self.use_direct_mode.get():
+                        stop_cmd = make_write_direct_mode_data(port, 0x00, 0)
+                    else:
+                        stop_cmd = make_start_speed(port, 0, 100, 0)
+                    self.send_command(stop_cmd, "Instant stop at min", priority=True)
+                self._last_sent_speed = 0
+                self._is_running = False
+                self._last_instant_speed = None
+                return
             # Avoid duplicate sends
             if self.connected and speed != self._last_sent_speed:
                 if self.use_direct_mode.get():
@@ -1548,10 +1581,24 @@ class TrainHubGUI:
             self.color_status_label.config(text="● Listening", fg="#ff9800")
         except Exception:
             pass
+        # Reset yellow indicator when enabling
+        try:
+            self._set_yellow_indicator('idle')
+        except Exception:
+            pass
 
         mode_name = "Color Index" if mode == 0 else "RGB"
         self.log_debug(f"✓ Color sensor enabled on port 0x{port:02X} ({port}) in {mode_name} mode")
         self.log_debug("Place colored objects in front of the sensor to see readings.")
+        # Log current yellow trigger config
+        try:
+            self.log_debug(
+                f"Yellow trigger config: R=[{self._yellow_r_min},{self._yellow_r_max}], "
+                f"G=[{self._yellow_g_min},{self._yellow_g_max}], B=[{self._yellow_b_min},{self._yellow_b_max}], "
+                f"required={self._yellow_required_seconds:.2f}s, cooldown={self._yellow_cooldown_seconds:.2f}s"
+            )
+        except Exception:
+            pass
         # Auto-fallback: if no data within 2 seconds, switch mode and retry
         self.root.after(2000, self._color_auto_fallback_check)
     
@@ -1578,6 +1625,11 @@ class TrainHubGUI:
         
         try:
             self.color_status_label.config(text="● Inactive", fg="#888888")
+        except Exception:
+            pass
+        # Reset yellow indicator on disable
+        try:
+            self._set_yellow_indicator('idle')
         except Exception:
             pass
         
@@ -1743,6 +1795,11 @@ class TrainHubGUI:
                     
                     if None not in (red, green, blue):
                         self.log_debug(f"✓ RGB: R={red}, G={green}, B={blue}")
+                        # Process RGB-triggered automation (e.g., Yellow stop/resume)
+                        try:
+                            self.process_rgb_triggers(red, green, blue)
+                        except Exception as _e:
+                            self.log_debug(f"RGB trigger handler error: {_e}")
                         self.root.after(0, lambda r=red, g=green, b=blue: self.update_rgb_display(r, g, b))
                     else:
                         self.log_debug(f"⚠ Could not parse RGB from payload")
@@ -1829,6 +1886,141 @@ class TrainHubGUI:
         self.current_color_value.set(red)  # Show red value as primary
         self.color_display.config(bg=hex_color)
         self.color_name_label.config(bg=hex_color, fg=text_color)
+
+    def _set_yellow_indicator(self, state: str, elapsed: float = None):
+        """Thread-safe UI update for the yellow-detection indicator.
+        state: 'idle' | 'detecting' | 'triggered'
+        elapsed: seconds seen so far (only used for 'detecting').
+        """
+        self._yellow_indicator_state = state
+        def _apply():
+            try:
+                if not hasattr(self, 'yellow_indicator_label') or self.yellow_indicator_label is None:
+                    return
+                if state == 'idle':
+                    txt = "Yellow: idle"
+                    fg = '#888888'
+                elif state == 'detecting':
+                    need = getattr(self, '_yellow_required_seconds', 1.0)
+                    seen = 0.0 if elapsed is None else max(0.0, min(need, elapsed))
+                    txt = f"Yellow: detecting ({seen:.2f}s/{need:.2f}s)"
+                    fg = '#FFC107'  # amber
+                else:  # triggered
+                    txt = "Yellow: triggered"
+                    fg = '#4CAF50'  # green
+                self.yellow_indicator_label.config(text=txt, fg=fg)
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _apply)
+        except Exception:
+            pass
+
+    def process_rgb_triggers(self, red: int, green: int, blue: int):
+        """Evaluate RGB rules; trigger actions when conditions are met.
+        Currently: if Yellow (R,G in 245-255 and B in 50-70) is seen for >= 1s,
+        stop train for 1s then resume previous speed.
+        """
+        if not self.connected:
+            return
+        # Only act when in RGB mode and no overlapping auto-stop
+        try:
+            if self.color_sensor_mode.get() != 3:
+                # Not in RGB mode; show idle
+                self._set_yellow_indicator('idle')
+                return
+        except Exception:
+            return
+
+        now = time.monotonic()
+        # Cooldown to prevent rapid retriggering
+        if now < self._yellow_cooldown_until_s:
+            self._yellow_start_s = None
+            self._set_yellow_indicator('idle')
+            return
+        if self._auto_stop_in_progress:
+            # Show triggered state during auto-stop
+            self._set_yellow_indicator('triggered')
+            return
+
+        is_yellow = (
+            self._yellow_r_min <= red <= self._yellow_r_max and
+            self._yellow_g_min <= green <= self._yellow_g_max and
+            self._yellow_b_min <= blue <= self._yellow_b_max
+        )
+
+        if is_yellow:
+            if self._yellow_start_s is None:
+                self._yellow_start_s = now
+                self._set_yellow_indicator('detecting', 0.0)
+                return
+            duration = now - self._yellow_start_s
+            # Update indicator with elapsed time
+            self._set_yellow_indicator('detecting', duration)
+            if duration >= self._yellow_required_seconds:
+                # Reached required duration; trigger auto stop/resume
+                self._yellow_start_s = None
+                self._yellow_cooldown_until_s = now + self._yellow_cooldown_seconds
+                self._set_yellow_indicator('triggered')
+                self._auto_stop_for_yellow()
+        else:
+            # Reset if color condition breaks
+            self._yellow_start_s = None
+            self._set_yellow_indicator('idle')
+
+    def _auto_stop_for_yellow(self):
+        """Stop for 1s and resume previous speed, using priority commands."""
+        if not self.connected or self._auto_stop_in_progress:
+            return
+        self._auto_stop_in_progress = True
+        # Reflect in UI
+        try:
+            self._set_yellow_indicator('triggered')
+        except Exception:
+            pass
+
+        port = 0
+        # Capture current speed to resume
+        resume_speed = self._last_sent_speed if self._last_sent_speed is not None else 0
+        self._resume_speed_after_stop = resume_speed
+
+        # Send immediate STOP
+        if self.use_direct_mode.get():
+            stop_cmd = make_write_direct_mode_data(port, 0x00, 0)
+        else:
+            stop_cmd = make_start_speed(port, 0, 100, 0)
+        self.send_command(stop_cmd, "Auto STOP (Yellow)", priority=True)
+        self._last_sent_speed = 0
+
+        # Schedule resume after 1s, only if resume speed was non-zero
+        def _resume_if_needed():
+            try:
+                if not self.connected:
+                    return
+                speed = self._resume_speed_after_stop
+                # Clear before sending to avoid loops
+                self._resume_speed_after_stop = None
+                if speed is None or speed == 0:
+                    return
+                if self.use_direct_mode.get():
+                    cmd = make_write_direct_mode_data(port, 0x00, speed if speed >= 0 else (speed + 256))
+                else:
+                    cmd = make_start_speed(port, speed, 100, 0)
+                self.send_command(cmd, "Auto RESUME (Yellow)", priority=True)
+                self._last_sent_speed = speed
+            finally:
+                self._auto_stop_in_progress = False
+                # Back to idle after resume
+                try:
+                    self._set_yellow_indicator('idle')
+                except Exception:
+                    pass
+
+        try:
+            self.root.after(1000, _resume_if_needed)
+        except Exception:
+            # As a fallback, clear the in-progress flag to avoid deadlock
+            self._auto_stop_in_progress = False
 
     def on_close(self):
         try:
