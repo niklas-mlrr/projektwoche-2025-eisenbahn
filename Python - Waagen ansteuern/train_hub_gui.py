@@ -143,7 +143,7 @@ class TrainHubGUI:
         self.current_color = tk.StringVar(value="Unknown")
         self.current_color_value = tk.IntVar(value=-1)
         self.color_sensor_enabled = False
-        self.color_sensor_mode = tk.IntVar(value=3)  # Default to RGB (3)
+        self.color_sensor_mode = 3  # Mode is fixed to RGB
         self._color_last_rx_ms = 0  # timestamp of last color RX (ms)
         self._color_auto_fallback_pending = False
         
@@ -540,19 +540,7 @@ class TrainHubGUI:
                           font=('Arial', 9), activebackground='#2b2b2b',
                           activeforeground='#ffffff').pack(side=tk.LEFT, padx=5)
         
-        # Mode selection
-        mode_frame = tk.Frame(port_frame, bg='#2b2b2b')
-        mode_frame.pack(pady=5)
-        tk.Label(mode_frame, text="Mode:", bg='#2b2b2b', fg='#ffffff',
-                font=('Arial', 10)).pack(side=tk.LEFT, padx=10)
-        tk.Radiobutton(mode_frame, text="Color Index (0-10)", variable=self.color_sensor_mode,
-                      value=0, bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
-                      font=('Arial', 9), activebackground='#2b2b2b',
-                      activeforeground='#ffffff').pack(side=tk.LEFT, padx=5)
-        tk.Radiobutton(mode_frame, text="RGB Values", variable=self.color_sensor_mode,
-                      value=3, bg='#2b2b2b', fg='#ffffff', selectcolor='#1e88e5',
-                      font=('Arial', 9), activebackground='#2b2b2b',
-                      activeforeground='#ffffff').pack(side=tk.LEFT, padx=5)
+        # Mode is now fixed to RGB, so selection is removed.
         
         # Stabilization settings
         stab_frame = tk.LabelFrame(port_frame, text="Stabilization (reduces flickering)", 
@@ -633,32 +621,7 @@ class TrainHubGUI:
                                               fg='#888888', font=('Arial', 10))
         self.yellow_indicator_label.pack(side=tk.LEFT, padx=20)
         
-        # Color legend
-        legend_frame = tk.LabelFrame(parent, text="Color Values Reference", bg='#2b2b2b',
-                                    fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
-        legend_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        colors_info = [
-            ("0: Black", "#000000"), ("1: Pink", "#FF69B4"), ("2: Purple", "#800080"),
-            ("3: Blue", "#0000FF"), ("4: Light Blue", "#87CEEB"), ("5: Cyan", "#00FFFF"),
-            ("6: Green", "#00FF00"), ("7: Yellow", "#FFFF00"), ("8: Orange", "#FFA500"),
-            ("9: Red", "#FF0000"), ("10: White", "#FFFFFF")
-        ]
-        
-        legend_grid = tk.Frame(legend_frame, bg='#2b2b2b')
-        legend_grid.pack(pady=5)
-        
-        for idx, (text, color) in enumerate(colors_info):
-            row = idx // 4
-            col = idx % 4
-            frame = tk.Frame(legend_grid, bg='#2b2b2b')
-            frame.grid(row=row, column=col, padx=5, pady=3)
-            
-            color_box = tk.Label(frame, bg=color, width=2, height=1, relief=tk.RAISED)
-            color_box.pack(side=tk.LEFT, padx=2)
-            
-            tk.Label(frame, text=text, bg='#2b2b2b', fg='#ffffff',
-                    font=('Arial', 8)).pack(side=tk.LEFT, padx=2)
+        # Color legend removed as Color Index mode is no longer available.
         
     # Connection Methods
     def connect_hub(self):
@@ -844,10 +807,7 @@ class TrainHubGUI:
         self.log_debug("Auto-scanning for attached devices...")
         self.root.after(500, self.auto_detect_ports)
         # Ensure color mode is RGB and auto-enable color sensor shortly after connect
-        try:
-            self.color_sensor_mode.set(3)
-        except Exception:
-            pass
+        # Color mode is now hardcoded to RGB (3).
         # Schedule enabling to allow connection to settle
         self.root.after(700, lambda: self.enable_color_sensor())
         
@@ -1591,7 +1551,7 @@ class TrainHubGUI:
             return
         
         port = self.color_sensor_port.get()
-        mode = self.color_sensor_mode.get()
+        mode = self.color_sensor_mode
         self.log_debug(f"Enabling color sensor on port 0x{port:02X} ({port}) with mode {mode}...")
         
         # Mode 0 = Color Index (0-10), Mode 3 = RGB values
@@ -1629,8 +1589,7 @@ class TrainHubGUI:
             )
         except Exception:
             pass
-        # Auto-fallback: if no data within 2 seconds, switch mode and retry
-        self.root.after(2000, self._color_auto_fallback_check)
+        # Auto-fallback is now disabled.
     
     def disable_color_sensor(self):
         """Disable color sensor notifications"""
@@ -1638,7 +1597,7 @@ class TrainHubGUI:
             return
         
         port = self.color_sensor_port.get()
-        mode = self.color_sensor_mode.get()
+        mode = self.color_sensor_mode
         self.log_debug(f"Disabling color sensor on port 0x{port:02X} ({port})...")
         
         # Set notify to False to disable notifications
@@ -1666,15 +1625,8 @@ class TrainHubGUI:
         self.log_debug(f"✓ Color sensor disabled on port 0x{port:02X} ({port})")
 
     def _color_auto_fallback_check(self):
-        """Switch mode automatically if no data was received shortly after enabling."""
-        if not (self.connected and self.color_sensor_enabled):
-            return
-        if self.current_color_value.get() == -1:
-            cur = self.color_sensor_mode.get()
-            alt = 3 if cur == 0 else 0
-            self.log_debug(f"No color data yet. Auto-switching mode {cur} -> {alt} and retrying...")
-            self.color_sensor_mode.set(alt)
-            self.enable_color_sensor()
+        """(DEPRECATED) This method is no longer used as color mode is fixed to RGB."""
+        pass
     
     def scan_all_ports_for_sensor(self):
         """Try to enable color sensor on all possible ports to find the right one"""
@@ -1761,7 +1713,7 @@ class TrainHubGUI:
             
             # Check if this is from our color sensor port
             if self.color_sensor_enabled and port == self.color_sensor_port.get():
-                mode = self.color_sensor_mode.get()
+                mode = self.color_sensor_mode
                 self.log_debug(f"✓ Color sensor data received! Mode={mode}, Length={len(data)}, Full data: {' '.join(f'{b:02X}' for b in data)}")
                 
                 # Update timestamp for auto-fallback check
@@ -1955,7 +1907,7 @@ class TrainHubGUI:
             return
         # Only act when in RGB mode and no overlapping auto-stop
         try:
-            if self.color_sensor_mode.get() != 3:
+            if self.color_sensor_mode != 3:
                 # Not in RGB mode; show idle
                 self._set_yellow_indicator('idle')
                 return
