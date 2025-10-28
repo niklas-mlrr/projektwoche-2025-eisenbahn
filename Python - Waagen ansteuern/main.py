@@ -161,7 +161,7 @@ class TrainHubGUI:
         self.working_ports = set()  # Track which ports have working motors
         
         # Arduino serial monitor variables
-        self.arduino_port_var = tk.StringVar(value="COM15")
+        self.arduino_port_var = tk.StringVar(value="COM3")
         self.arduino_baud_var = tk.IntVar(value=9600)
         self.arduino_value_var = tk.IntVar(value=0)
         self.arduino_running = False
