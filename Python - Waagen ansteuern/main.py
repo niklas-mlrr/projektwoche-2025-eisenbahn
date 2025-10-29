@@ -12,6 +12,9 @@ import queue
 import serial
 from datetime import datetime
 import time
+import sys
+import os
+import subprocess
 
 # LWP3 Protocol Constants
 LWP3_SERVICE_UUID = "00001623-1212-efde-1623-785feabcd123"
@@ -185,6 +188,7 @@ class TrainHubGUI:
         self._instant_send_after_id = None  # after() id for coalescing slider sends
         self._manual_override_until = 0.0  # timestamp until which mapping is suppressed
         self._mapping_update_in_progress = False  # true while mapping updates slider
+        self._conn_watchdog_after_id = None  # Tk after id for connection watchdog
         # RGB trigger logic (Yellow stop/resume)
         self._yellow_start_s = None  # monotonic seconds when yellow first detected
         self._yellow_cooldown_until_s = 0.0  # monotonic seconds until which retrigger is blocked
@@ -772,6 +776,19 @@ class TrainHubGUI:
             except Exception as e:
                 self.log_debug(f"Could not access BLE client: {e}")
             
+            # Install BLE disconnected callback if available
+            try:
+                if hasattr(self.connection, 'client') and hasattr(self.connection.client, 'set_disconnected_callback'):
+                    def _on_bleak_disconnect(_client):
+                        try:
+                            self.root.after(0, lambda: self.handle_ble_disconnected("bleak_callback"))
+                        except Exception:
+                            pass
+                    self.connection.client.set_disconnected_callback(_on_bleak_disconnect)
+                    self.log_debug("✓ Disconnected callback installed")
+            except Exception as e:
+                self.log_debug(f"Could not set disconnect callback: {e}")
+            
             # Test if we can receive data by requesting hub properties
             self.log_debug("Testing RX by requesting hub name...")
             test_cmd = bytes([0x05, 0x00, 0x01, 0x01, 0x05])  # Request hub name
@@ -830,6 +847,11 @@ class TrainHubGUI:
                     await asyncio.sleep(0.001)
             except Exception as e:
                 print(f"Command error: {e}")
+                try:
+                    self.root.after(0, lambda: self.handle_ble_disconnected("command_error"))
+                except Exception:
+                    pass
+                break
     
     def connection_success(self):
         self.status_label.config(text="Status: Connected ✓", fg='#4CAF50')
@@ -837,6 +859,8 @@ class TrainHubGUI:
         self.disconnect_btn.config(state=tk.NORMAL)
         self.log_debug("✓ Successfully connected to Train Base")
         self.update_connection_info()
+        # Start watchdog to detect unexpected disconnects
+        self._start_connection_watchdog()
         
         # Auto-scan ports on connection
         self.log_debug("Auto-scanning for attached devices...")
@@ -876,6 +900,90 @@ class TrainHubGUI:
                 await asyncio.sleep(0.1)  # Give time for cleanup
             except:
                 pass
+
+    # Disconnection handling and watchdog
+    def handle_ble_disconnected(self, source: str = ""):
+        """Handle unexpected BLE disconnect (e.g., hub powered off)."""
+        try:
+            self.log_debug(f"Detected hub disconnect ({source})")
+        except Exception:
+            pass
+        if not self.connected:
+            # Already handled
+            return
+        self.connected = False
+        # Stop processors
+        try:
+            self.command_queue.put(None)
+            self.priority_queue.put(None)
+        except Exception:
+            pass
+        # Cancel watchdog if running
+        try:
+            if self._conn_watchdog_after_id is not None:
+                self.root.after_cancel(self._conn_watchdog_after_id)
+                self._conn_watchdog_after_id = None
+        except Exception:
+            pass
+        # Attempt async cleanup
+        try:
+            if self.loop and not self.loop.is_closed():
+                try:
+                    asyncio.run_coroutine_threadsafe(self.async_disconnect(), self.loop)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Update UI
+        try:
+            self.status_label.config(text="Status: Disconnected", fg='#ff9800')
+            self.connect_btn.config(state=tk.NORMAL)
+            self.disconnect_btn.config(state=tk.DISABLED)
+        except Exception:
+            pass
+        # Restart application
+        try:
+            self.root.after(300, self._restart_program)
+        except Exception:
+            try:
+                self._restart_program()
+            except Exception:
+                pass
+
+    def _restart_program(self):
+        try:
+            subprocess.Popen([sys.executable] + sys.argv)
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    def _start_connection_watchdog(self):
+        """Start a periodic poll to detect connection loss when callback isn't triggered."""
+        try:
+            if self._conn_watchdog_after_id is not None:
+                self.root.after_cancel(self._conn_watchdog_after_id)
+        except Exception:
+            pass
+        self._conn_watchdog_after_id = self.root.after(1000, self._connection_watchdog_tick)
+
+    def _connection_watchdog_tick(self):
+        try:
+            if not self.connected:
+                return
+            if self.connection and hasattr(self.connection, 'client'):
+                client = self.connection.client
+                is_conn = getattr(client, 'is_connected', None)
+                if is_conn is False:
+                    self.handle_ble_disconnected("watchdog")
+                    return
+        except Exception:
+            pass
+        # Reschedule
+        self._conn_watchdog_after_id = self.root.after(1000, self._connection_watchdog_tick)
     
     # Command Methods
     def send_command(self, cmd: bytes, description: str = "", *, priority: bool = False, kind: str = "other"):
