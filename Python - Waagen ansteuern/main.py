@@ -292,14 +292,14 @@ class TrainHubGUI:
                                      fg='#ffffff', font=('Arial', 10, 'bold'), pady=10)
         instant_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        tk.Label(instant_frame, text="Speed: +30 to +100 (instant)", bg='#2b2b2b', fg='#ffffff',
+        tk.Label(instant_frame, text="Speed: +35 to +100 (instant)", bg='#2b2b2b', fg='#ffffff',
                 font=('Arial', 9)).pack()
         
         # Create instant speed variable
         self.instant_speed_var = tk.IntVar(value=40)
         
         # Create slider without command to avoid early callbacks during startup
-        self.instant_slider = tk.Scale(instant_frame, from_=30, to=100, orient=tk.HORIZONTAL,
+        self.instant_slider = tk.Scale(instant_frame, from_=35, to=100, orient=tk.HORIZONTAL,
                                        variable=self.instant_speed_var, bg='#3c3c3c', fg='#ffffff',
                                        highlightthickness=0, length=400, troughcolor='#1e88e5',
                                        resolution=1)
@@ -961,13 +961,13 @@ class TrainHubGUI:
             try:
                 magnitude = int(self.instant_speed_var.get())
             except Exception:
-                magnitude = 30
-            magnitude = max(30, min(100, magnitude))
+                magnitude = 35
+            magnitude = max(35, min(100, magnitude))
             sign = 1 if self.instant_direction.get() >= 0 else -1
             speed = magnitude * sign
             port = 0
-            # If slider is at minimum (30), treat as STOP instead of speed 30
-            if magnitude <= 30:
+            # If slider is at minimum (35), treat as STOP instead of speed 35
+            if magnitude <= 35:
                 if self.connected and self._last_sent_speed != 0:
                     if self.use_direct_mode.get():
                         stop_cmd = make_write_direct_mode_data(port, 0x00, 0)
@@ -1000,8 +1000,8 @@ class TrainHubGUI:
         try:
             magnitude = int(self.instant_speed_var.get())
         except Exception:
-            magnitude = 30
-        magnitude = max(30, min(100, magnitude))
+            magnitude = 35
+        magnitude = max(35, min(100, magnitude))
 
         # Flip target direction
         try:
@@ -1302,7 +1302,7 @@ class TrainHubGUI:
                 step = int(self._speed_accum)
                 self._speed_accum -= step
                 current = int(self.instant_speed_var.get())
-                new = max(30, min(100, current + step))
+                new = max(35, min(100, current + step))
                 if new != current:
                     # Update the slider and explicitly invoke the handler to send motor command
                     self._mapping_update_in_progress = True
